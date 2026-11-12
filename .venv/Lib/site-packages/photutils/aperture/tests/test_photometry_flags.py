@@ -1,0 +1,663 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+"""
+Tests for the aperture photometry quality flags.
+"""
+
+import astropy.units as u
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose, assert_array_equal
+
+from photutils.aperture import (APERTURE_FLAGS, AperturePhotometry,
+                                ApertureStats, CircularAnnulus,
+                                CircularAperture, EllipticalAperture,
+                                PolygonAperture, RectangularAperture,
+                                aperture_photometry)
+from photutils.aperture.flags import _counts_to_flag_bits
+from photutils.aperture.tests.conftest import (UNIT_SHAPE,
+                                               NoBatchCircularAperture)
+from photutils.segmentation import SegmentationImage
+
+APERTURE_FACTORIES = [
+    lambda xy: CircularAperture(xy, r=3.0),
+    lambda xy: CircularAnnulus(xy, r_in=2.0, r_out=4.0),
+    lambda xy: EllipticalAperture(xy, a=4.0, b=2.5, theta=0.5),
+    lambda xy: RectangularAperture(xy, w=5.0, h=4.0, theta=0.3),
+]
+
+METHODS = [('exact', 5), ('center', 1), ('subpixel', 4)]
+
+
+def _flags(aperture, data, **kwargs):
+    return AperturePhotometry(data, aperture, **kwargs).flags
+
+
+def _bbox_clipped_candidates(aper, shape):
+    """
+    Per-source indicator of whether the aperture bounding
+    box overlaps the data but is clipped by a data edge (the
+    ``FLAG_COL_BBOX_CLIPPED`` candidate condition, computed from the
+    aperture bounding boxes).
+    """
+    ny, nx = shape
+    candidates = []
+    for bbox in aper._bbox:
+        overlap = (bbox.ixmin < nx and bbox.ixmax > 0
+                   and bbox.iymin < ny and bbox.iymax > 0)
+        clipped = (bbox.ixmin < 0 or bbox.iymin < 0
+                   or bbox.ixmax > nx or bbox.iymax > ny)
+        candidates.append(overlap and clipped)
+    return np.array(candidates, dtype=bool)
+
+
+def _bruteforce_outside_weights(aper, shape, *, method, subpixels, candidates):
+    """
+    Reference (nongated) per-source outside-weight test, built from
+    explicit aperture masks. This replicates the mask-based branch of
+    ``_resolve_outside_weights``, including its restriction to the
+    candidate (bbox-clipped) sources.
+    """
+    w_out = np.zeros(candidates.shape, dtype=bool)
+    idx = np.flatnonzero(candidates)
+    if idx.size == 0:
+        return w_out
+
+    sub = aper if aper.isscalar else aper[idx]
+    masks = sub.to_mask(method=method, subpixels=subpixels)
+    if sub.isscalar:
+        masks = [masks]
+    for i, mask in zip(idx, masks, strict=True):
+        n_total = np.count_nonzero(mask.data)
+        slc_large, slc_small = mask.get_overlap_slices(shape)
+        if slc_large is None:
+            w_out[i] = n_total > 0
+        else:
+            n_in = np.count_nonzero(mask.data[slc_small])
+            w_out[i] = n_total > n_in
+    return w_out
+
+
+class TestOverlapFlags:
+    """
+    Tests for the no_overlap, partial_overlap, and no_pixels flags.
+    """
+
+    def test_no_flags(self, unit_data):
+        """
+        Test that a clean interior source has no flags set.
+        """
+        data = unit_data
+        aper = CircularAperture((12, 12), r=3.0)
+        assert_array_equal(_flags(aper, data), [0])
+
+    @pytest.mark.parametrize('factory', APERTURE_FACTORIES)
+    @pytest.mark.parametrize(('method', 'subpixels'), METHODS)
+    def test_no_overlap(self, unit_data, factory, method, subpixels):
+        """
+        Test that fully off-image apertures set no_overlap and no_pixels.
+        """
+        data = unit_data
+        aper = factory([(-50.0, 12.0), (12.0, 12.0)])
+        result = AperturePhotometry(data, aper, method=method,
+                                    subpixels=subpixels)
+        expected = APERTURE_FLAGS.NO_OVERLAP | APERTURE_FLAGS.NO_PIXELS
+        assert result.flags[0] == expected
+        assert np.isnan(result.flux[0])
+        assert result.flags[1] == 0
+
+    @pytest.mark.parametrize('factory', APERTURE_FACTORIES)
+    @pytest.mark.parametrize(('method', 'subpixels'), METHODS)
+    def test_partial_overlap(self, unit_data, factory, method, subpixels):
+        """
+        Test that apertures straddling an edge set partial_overlap.
+        """
+        data = unit_data
+        aper = factory([(0.0, 12.0), (12.0, 24.5), (12.0, 12.0)])
+        flags = _flags(aper, data, method=method, subpixels=subpixels)
+        assert flags[0] == APERTURE_FLAGS.PARTIAL_OVERLAP
+        assert flags[1] == APERTURE_FLAGS.PARTIAL_OVERLAP
+        assert flags[2] == 0
+
+    def test_no_overlap_close_to_edge(self, unit_data):
+        """
+        Test an aperture whose bounding box overlaps the data but whose
+        nonzero-weight pixels are all outside (precise no_overlap).
+        """
+        data = unit_data
+        # bbox column 0 overlaps the data, but with the "center" method
+        # the pixel center at x=0 (distance 1.2) is outside the circle
+        aper = CircularAperture((-1.2, 12.0), r=0.8)
+        result = AperturePhotometry(data, aper, method='center')
+        assert result.flags == (APERTURE_FLAGS.NO_OVERLAP
+                                | APERTURE_FLAGS.NO_PIXELS)
+        # The results are undefined, the same as for an aperture whose
+        # bounding box does not overlap the data
+        assert np.isnan(result.flux)
+        assert np.isnan(result.area)
+
+        # With the exact method, the aperture area extends into the data
+        result = AperturePhotometry(data, aper, method='exact')
+        assert result.flags == APERTURE_FLAGS.PARTIAL_OVERLAP
+
+    def test_clipped_bbox_only(self, unit_data):
+        """
+        Test that a clipped bounding box alone does not set
+        partial_overlap when all nonzero weights are inside the data.
+        """
+        data = unit_data
+        # bbox extends to column -1, but the pixel center at x=-1
+        # (distance 1.2 > r=0.8) is outside the circle
+        aper = CircularAperture((0.2, 12.0), r=0.8)
+        assert_array_equal(_flags(aper, data, method='center'), [0])
+
+        # The exact-method footprint does extend outside
+        flags = _flags(aper, data, method='exact')
+        assert_array_equal(flags, [APERTURE_FLAGS.PARTIAL_OVERLAP])
+
+    def test_no_pixels_tiny_aperture(self, unit_data):
+        """
+        Test that a tiny aperture with the "center" method sets no_pixels.
+        """
+        data = unit_data
+        # Nearest pixel centers are sqrt(0.5) ~ 0.707 away
+        aper = CircularAperture((12.5, 12.5), r=0.4)
+        result = AperturePhotometry(data, aper, method='center')
+        assert result.flags == APERTURE_FLAGS.NO_PIXELS
+        assert result.flux == 0.0
+
+        # The exact method has a nonzero footprint
+        assert_array_equal(_flags(aper, data, method='exact'), [0])
+
+
+class TestPolygonOverlapFlags:
+    """
+    A polygon whose vertices are not centered on its positions still has
+    a tight bounding box, so the partial_overlap flag tracks the polygon
+    itself rather than the box.
+    """
+
+    @pytest.mark.parametrize(('method', 'subpixels'), METHODS)
+    def test_offcenter_inside(self, method, subpixels):
+        """
+        Test that a polygon lying entirely inside the data is not flagged as
+        partial_overlap.
+        """
+        data = np.ones((12, 12))
+        # The centroid of this triangle is well off-center from the
+        # vertices, so its bounding box is not centered on ``positions``
+        aper = PolygonAperture.from_vertices([(1.0, 1.0), (9.0, 1.0),
+                                              (9.0, 9.0)])
+        # The tight bounding box lies entirely within the data
+        bbox = aper.bbox
+        assert bbox.ixmin >= 0
+        assert bbox.ixmax <= data.shape[1]
+        assert bbox.iymin >= 0
+        assert bbox.iymax <= data.shape[0]
+
+        result = AperturePhotometry(data, aper, method=method,
+                                    subpixels=subpixels)
+        assert result.flags == 0
+        stats = ApertureStats(data, aper, sum_method=method,
+                              subpixels=subpixels)
+        assert stats.flags == 0
+
+    @pytest.mark.parametrize(('method', 'subpixels'), METHODS)
+    def test_offcenter_partial(self, method, subpixels):
+        """
+        Test that a polygon extending past a data edge is still flagged as
+        partial_overlap.
+        """
+        data = np.ones((12, 12))
+        # The part of this triangle beyond the left data edge contains
+        # whole pixels, so every mask method sees weight outside the data
+        aper = PolygonAperture.from_vertices([(-3.0, 4.0), (9.0, 1.0),
+                                              (9.0, 9.0)])
+        assert aper.bbox.ixmin < 0
+
+        result = AperturePhotometry(data, aper, method=method,
+                                    subpixels=subpixels)
+        assert result.flags == APERTURE_FLAGS.PARTIAL_OVERLAP
+        stats = ApertureStats(data, aper, sum_method=method,
+                              subpixels=subpixels)
+        assert stats.flags == APERTURE_FLAGS.PARTIAL_OVERLAP
+
+
+class TestMaskedAndNonFiniteFlags:
+    """
+    Tests for the masked_pixels, all_masked, and nonfinite flags.
+    """
+
+    @pytest.mark.parametrize(('method', 'subpixels'), METHODS)
+    def test_masked_pixels(self, unit_data, method, subpixels):
+        """
+        Test the masked_pixels and all_masked flags.
+        """
+        data = unit_data
+
+        # One masked pixel inside the aperture
+        mask = np.zeros(UNIT_SHAPE, dtype=bool)
+        mask[12, 12] = True
+        aper = CircularAperture((12, 12), r=3.0)
+        flags = _flags(aper, data, mask=mask, method=method,
+                       subpixels=subpixels)
+        assert flags == APERTURE_FLAGS.MASKED_PIXELS
+
+        # Masked pixel inside the bounding box but outside the aperture
+        mask = np.zeros(UNIT_SHAPE, dtype=bool)
+        mask[9, 9] = True
+        flags = _flags(aper, data, mask=mask, method=method,
+                       subpixels=subpixels)
+        assert flags == 0
+
+        # Fully masked aperture
+        mask = np.zeros(UNIT_SHAPE, dtype=bool)
+        mask[8:17, 8:17] = True
+        flags = _flags(aper, data, mask=mask, method=method,
+                       subpixels=subpixels)
+        assert flags == (APERTURE_FLAGS.MASKED_PIXELS
+                         | APERTURE_FLAGS.ALL_MASKED)
+
+    def test_non_finite_data(self, unit_mask):
+        """
+        Test the non_finite_data flag.
+
+        In photometry, unmasked nonfinite values contribute to the sum
+        (making it NaN). They do not set all_masked.
+
+        This tests the legacy (nonclass) engine call directly
+        (``mask_nonfinite=False``, the default), which corrupts the sum
+        with the nonfinite value instead of masking it out, unlike
+        `AperturePhotometry`.
+        """
+        data = np.ones(UNIT_SHAPE)
+        data[12, 12] = np.nan
+        aper = CircularAperture((12, 12), r=3.0)
+        result = aper._photometry(data)
+        assert result.flags[0] == APERTURE_FLAGS.NON_FINITE_DATA
+        assert np.isnan(result.flux[0])
+
+        # An all-NaN aperture is still non_finite_data only (the pixels
+        # contribute, so all_masked is not set)
+        data = np.full(UNIT_SHAPE, np.nan)
+        result = aper._photometry(data)
+        assert result.flags[0] == APERTURE_FLAGS.NON_FINITE_DATA
+
+        # A masked nonfinite pixel counts only as masked
+        data = np.ones(UNIT_SHAPE)
+        data[12, 12] = np.nan
+        mask = unit_mask
+        mask[12, 12] = True
+        flags = _flags(aper, data, mask=mask)
+        assert flags == APERTURE_FLAGS.MASKED_PIXELS
+
+    def test_non_finite_error(self, unit_data):
+        """
+        Test the non_finite_error flag.
+        """
+        data = unit_data
+        error = np.ones(UNIT_SHAPE)
+        error[12, 12] = np.inf
+        aper = CircularAperture((12, 12), r=3.0)
+        flags = _flags(aper, data, error=error)
+        assert flags == APERTURE_FLAGS.NON_FINITE_ERROR
+
+        # Without an error array, the flag is never set
+        assert_array_equal(_flags(aper, data), [0])
+
+
+class TestSegmentationFlags:
+    """
+    Tests for the neighbor_pixels and uncorrected_pixels flags.
+    """
+
+    @pytest.mark.parametrize('mask_method', ['mask', 'source_only', 'correct'])
+    def test_neighbor_pixels(self, unit_data, mask_method):
+        """
+        Test the neighbor_pixels flag for all segmentation mask methods.
+        """
+        data = unit_data
+        segm = np.zeros(UNIT_SHAPE, dtype=int)
+        segm[10:15, 10:15] = 1
+        segm[12, 14] = 2  # neighbor pixel inside the aperture
+        aper = CircularAperture((12, 12), r=3.0)
+        flags = _flags(aper, data,
+                       segmentation_image=SegmentationImage(segm), labels=1,
+                       mask_method=mask_method)
+        assert flags == APERTURE_FLAGS.NEIGHBOR_PIXELS
+
+        # Without any neighbor pixels inside the aperture, no flag is set
+        segm2 = np.zeros(UNIT_SHAPE, dtype=int)
+        segm2[10:15, 10:15] = 1
+        flags = _flags(aper, data,
+                       segmentation_image=SegmentationImage(segm2), labels=1,
+                       mask_method=mask_method)
+        assert flags == 0
+
+    def test_background_only_neighbor_pixels(self, unit_data):
+        """
+        Test the neighbor_pixels flag with mask_method='background_only',
+        where every labeled pixel counts as a neighbor pixel.
+        """
+        data = unit_data
+        segm = np.zeros(UNIT_SHAPE, dtype=int)
+        segm[11:14, 11:14] = 1  # a source inside the aperture
+        aper = CircularAperture((12, 12), r=3.0)
+        flags = _flags(aper, data, segmentation_image=SegmentationImage(segm),
+                       mask_method='background_only')
+        assert flags == APERTURE_FLAGS.NEIGHBOR_PIXELS
+
+        # An aperture on pure background is not flagged
+        aper = CircularAperture((4, 4), r=3.0)
+        flags = _flags(aper, data, segmentation_image=SegmentationImage(segm),
+                       mask_method='background_only')
+        assert flags == 0
+
+    def test_uncorrected_pixels(self, unit_data):
+        """
+        Test the uncorrected_pixels flag with mask_method='correct'.
+        """
+        data = unit_data
+        segm = np.zeros(UNIT_SHAPE, dtype=int)
+        segm[10:15, 10:15] = 1
+        segm[12, 14] = 2  # neighbor whose mirror (12, 10) is a source pixel
+        segm[12, 10] = 2  # make the mirror a neighbor too: uncorrectable
+        aper = CircularAperture((12, 12), r=3.0)
+        flags = _flags(aper, data,
+                       segmentation_image=SegmentationImage(segm), labels=1,
+                       mask_method='correct')
+        assert flags == (APERTURE_FLAGS.NEIGHBOR_PIXELS
+                         | APERTURE_FLAGS.UNCORRECTED_PIXELS)
+
+        # A correctable neighbor does not set uncorrected_pixels
+        segm[12, 10] = 0
+        flags = _flags(aper, data,
+                       segmentation_image=SegmentationImage(segm), labels=1,
+                       mask_method='correct')
+        assert flags == APERTURE_FLAGS.NEIGHBOR_PIXELS
+
+
+class TestMaskPathParity:
+    """
+    The mask-based code path must set the same flags as the batch
+    driver.
+    """
+
+    @pytest.mark.parametrize(('method', 'subpixels'), METHODS)
+    def test_basic(self, unit_mask, method, subpixels):
+        """
+        Test that the mask-based code path produces flags identical to the
+        batch Cython driver.
+        """
+        rng = np.random.default_rng(0)
+        data = rng.normal(1.0, 0.1, size=UNIT_SHAPE)
+        data[13, 12] = np.nan
+        error = np.ones(UNIT_SHAPE)
+        error[10, 12] = np.inf
+        mask = unit_mask
+        mask[12, 12] = True
+
+        xy = [(12.0, 12.0), (0.0, 12.0), (-50.0, 12.0), (24.5, 24.5),
+              (0.2, 12.0), (-1.2, 12.0)]
+        batch_aper = CircularAperture(xy, r=3.0)
+        nobatch_aper = NoBatchCircularAperture(xy, r=3.0)
+
+        kwargs = {'error': error, 'mask': mask, 'method': method,
+                  'subpixels': subpixels}
+        result_batch = batch_aper._photometry(data, **kwargs)
+        result_nobatch = nobatch_aper._photometry(data, **kwargs)
+        assert_array_equal(result_batch.flags, result_nobatch.flags)
+        assert_allclose(result_batch.flux,
+                        result_nobatch.flux, rtol=1e-12,
+                        equal_nan=True)
+
+    def test_segmentation(self, unit_data):
+        """
+        Test batch/mask-path flag parity with segmentation masking.
+        """
+        data = unit_data
+        segm = np.zeros(UNIT_SHAPE, dtype=int)
+        segm[10:15, 10:15] = 1
+        segm[12, 14] = 2
+        segm[12, 10] = 2
+        segm[3:7, 3:7] = 3
+        xy = [(12.0, 12.0), (5.0, 5.0)]
+        labels = [1, 3]
+        segm = SegmentationImage(segm)
+
+        for mask_method in ('mask', 'source_only', 'background_only',
+                            'correct'):
+            flags_batch = CircularAperture(xy, r=3.0)._photometry(
+                data, segmentation_image=segm, labels=labels,
+                mask_method=mask_method).flags
+            flags_nobatch = NoBatchCircularAperture(xy, r=3.0)._photometry(
+                data, segmentation_image=segm, labels=labels,
+                mask_method=mask_method).flags
+            assert_array_equal(flags_batch, flags_nobatch)
+
+    @pytest.mark.parametrize('mask_method', ['mask', 'source_only', 'correct'])
+    @pytest.mark.parametrize('nan_pixel', [(12, 14), (12, 10)],
+                             ids=['nan_neighbor', 'nan_mirror'])
+    def test_nonfinite_segmentation(self, unit_data, mask_method, nan_pixel):
+        """
+        Test batch/mask-path parity when nonfinite masking (the
+        AperturePhotometry path) combines with segmentation masking.
+
+        Nonfinite pixels must be masked before the segmentation handling,
+        so a NaN neighbor pixel is excluded as nonfinite (not counted as
+        a neighbor pixel or mirror-corrected) and a NaN mirror pixel makes
+        its neighbor uncorrectable with mask_method='correct', matching the
+        batch kernel and ApertureStats.
+        """
+        data = unit_data
+        data[nan_pixel] = np.nan
+        segm = np.zeros(UNIT_SHAPE, dtype=int)
+        segm[10:15, 10:15] = 1
+        segm[12, 14] = 2  # neighbor pixel whose mirror is (12, 10)
+
+        kwargs = {'segmentation_image': SegmentationImage(segm), 'labels': [1],
+                  'mask_method': mask_method}
+        batch_aper = CircularAperture((12.0, 12.0), r=3.0)
+        nobatch_aper = NoBatchCircularAperture((12.0, 12.0), r=3.0)
+        result_batch = AperturePhotometry(data, batch_aper, **kwargs)
+        result_nobatch = AperturePhotometry(data, nobatch_aper, **kwargs)
+        assert_array_equal(result_batch.flags, result_nobatch.flags)
+        assert_allclose(result_batch.flux, result_nobatch.flux, rtol=1e-12)
+        assert_allclose(result_batch.area.value, result_nobatch.area.value,
+                        rtol=1e-12)
+
+        # The NaN pixel is excluded as non_finite_data in both paths
+        assert result_batch.flags & APERTURE_FLAGS.NON_FINITE_DATA
+        stats = ApertureStats(data, batch_aper, **kwargs)
+        assert result_batch.flags == stats.flags
+        assert_allclose(result_batch.flux, stats.sum, rtol=1e-12)
+
+        # The batch gather kernel (the "center" statistics) must test
+        # finiteness per pixel, including at the mirror pixel of a
+        # corrected neighbor pixel, matching the mask-based path.
+        stats_nobatch = ApertureStats(data, nobatch_aper, **kwargs)
+        assert stats._fast_gather is not None
+        assert stats_nobatch._fast_gather is None
+        for prop in ('mean', 'median', 'center_aper_area'):
+            assert_allclose(getattr(stats, prop), getattr(stats_nobatch, prop),
+                            rtol=1e-12, err_msg=prop)
+
+    @pytest.mark.parametrize('nan_pixel', [(12, 13), (12, 10)],
+                             ids=['nan_source', 'nan_background'])
+    def test_nonfinite_background_only(self, unit_data, nan_pixel):
+        """
+        Test batch/mask-path parity when nonfinite masking combines
+        with mask_method='background_only'.
+
+        A NaN source pixel is excluded as nonfinite (not counted as a
+        neighbor pixel) and a NaN background pixel is excluded as
+        nonfinite, matching the batch kernel and ApertureStats.
+        """
+        data = unit_data
+        data[nan_pixel] = np.nan
+        segm = np.zeros(UNIT_SHAPE, dtype=int)
+        segm[11:14, 11:14] = 1  # a source inside the aperture
+
+        kwargs = {'segmentation_image': SegmentationImage(segm),
+                  'mask_method': 'background_only'}
+        batch_aper = CircularAperture((12.0, 12.0), r=3.0)
+        nobatch_aper = NoBatchCircularAperture((12.0, 12.0), r=3.0)
+        result_batch = AperturePhotometry(data, batch_aper, **kwargs)
+        result_nobatch = AperturePhotometry(data, nobatch_aper, **kwargs)
+        assert_array_equal(result_batch.flags, result_nobatch.flags)
+        assert_allclose(result_batch.flux, result_nobatch.flux, rtol=1e-12)
+        assert_allclose(result_batch.area.value, result_nobatch.area.value,
+                        rtol=1e-12)
+
+        expected = (APERTURE_FLAGS.NON_FINITE_DATA
+                    | APERTURE_FLAGS.NEIGHBOR_PIXELS)
+        assert result_batch.flags == expected
+        stats = ApertureStats(data, batch_aper, **kwargs)
+        assert result_batch.flags == stats.flags
+        assert_allclose(result_batch.flux, stats.sum, rtol=1e-12)
+
+
+class TestFlagsAPI:
+    """
+    Tests for how the flags are exposed by the photometry classes.
+    """
+
+    def test_flag_combinations(self, unit_data, unit_mask):
+        """
+        Test that multiple conditions combine bitwise.
+        """
+        data = unit_data
+        data[12, 6] = np.nan  # outside the r=3 aperture at (0, 12)
+        mask = unit_mask
+        mask[10, 1] = True
+        aper = CircularAperture((0.0, 12.0), r=3.0)  # straddles left edge
+        flags = _flags(aper, data, mask=mask)
+        assert flags == (APERTURE_FLAGS.PARTIAL_OVERLAP
+                         | APERTURE_FLAGS.MASKED_PIXELS)
+
+    def test_flags_multiple_apertures(self, unit_data):
+        """
+        Test the AperturePhotometry flags for multiple positions and a
+        list of apertures (2D flags).
+        """
+        data = unit_data
+        xy = [(12.0, 12.0), (-50.0, 12.0), (0.0, 12.0)]
+        aper = CircularAperture(xy, r=3.0)
+        phot = AperturePhotometry(data, aper)
+        expected = [0, APERTURE_FLAGS.NO_OVERLAP | APERTURE_FLAGS.NO_PIXELS,
+                    APERTURE_FLAGS.PARTIAL_OVERLAP]
+        assert_array_equal(phot.flags, expected)
+
+        # The flags are multidimensional for multiple apertures
+        aper2 = CircularAperture(xy, r=4.0)
+        phot = AperturePhotometry(data, [aper, aper2])
+        assert_array_equal(phot.flags[:, 0], expected)
+        assert_array_equal(phot.flags[:, 1], expected)
+
+    def test_legacy_function_has_no_flags(self, unit_data):
+        """
+        Test that the legacy aperture_photometry function output table
+        contains no flags or area columns.
+        """
+        xy = [(12.0, 12.0), (0.0, 12.0)]
+        aper = CircularAperture(xy, r=3.0)
+        tbl = aperture_photometry(unit_data, aper)
+        assert tbl.colnames == ['id', 'x_center', 'y_center',
+                                'aperture_sum']
+
+    def test_flags_with_units(self):
+        """
+        Test that flags are also set for Quantity inputs.
+        """
+        data = np.ones(UNIT_SHAPE) * u.Jy
+        data[12, 12] = np.nan * u.Jy
+        aper = CircularAperture((12, 12), r=3.0)
+        phot = AperturePhotometry(data, aper)
+        assert phot.flags == APERTURE_FLAGS.NON_FINITE_DATA
+
+    def test_scalar_flag_counts(self):
+        """
+        Test that _counts_to_flag_bits accepts 1D count rows and scalar
+        overlap/w_out values.
+        """
+        counts = np.zeros(8, dtype=int)
+        flags = _counts_to_flag_bits(counts, np.False_, np.False_)
+        assert flags[0] == (APERTURE_FLAGS.NO_OVERLAP
+                            | APERTURE_FLAGS.NO_PIXELS)
+
+
+class TestResolveOutsideWeights:
+    """
+    Tests for the precise outside-weight test used by the
+    partial_overlap flag.
+    """
+
+    def test_no_mask_overlap(self):
+        """
+        Test that _resolve_outside_weights returns True for a candidate
+        whose aperture mask does not actually overlap the data.
+
+        In practice, the caller only ever marks a source as a candidate
+        when its aperture mask does overlap the data, so the mask's
+        bounding box is never actually clipped away entirely. This
+        directly exercises that defensive branch. A non-'exact' method is
+        used because the 'exact' method takes the gated fast path (see
+        ``_resolve_outside_weights``).
+        """
+        aper = CircularAperture((-5.0, 12.0), r=3.0)
+        shape = (25, 25)
+        mask = aper.to_mask(method='center')
+        assert mask.get_overlap_slices(shape) == (None, None)
+
+        candidates = np.array([True])
+        w_out = aper._resolve_outside_weights(shape, method='center',
+                                              subpixels=5,
+                                              candidates=candidates)
+        assert w_out[0]
+
+    @pytest.mark.parametrize('factory', APERTURE_FACTORIES)
+    def test_exact_gating(self, factory):
+        """
+        Test that the gated 'exact' fast path in _resolve_outside_weights
+        matches the explicit per-source mask computation.
+
+        For the 'exact' method the minimal bounding box is tight, so a
+        bbox that is clipped by a data edge always leaves a positive-area
+        aperture sliver outside the data. The gated path returns the
+        bbox-clipped candidates unchanged. This must equal the reference
+        mask-based outside-weight test for a mix of interior, edge, corner,
+        and fully off-image positions.
+        """
+        ny, nx = UNIT_SHAPE
+        xy = [(12.0, 12.0),  # interior (not a candidate)
+              (0.0, 12.0), (nx - 1.0, 12.0),  # left/right edges
+              (12.0, 0.0), (12.0, ny - 1.0),  # bottom/top edges
+              (0.0, 0.0), (nx - 1.0, ny - 1.0),  # corners
+              (0.0, ny - 1.0), (nx - 1.0, 0.0),  # corners
+              (1.5, 12.0), (12.0, ny - 2.0),  # near edges
+              (-50.0, 12.0)]  # fully off-image (not a candidate)
+        aper = factory(xy)
+
+        candidates = _bbox_clipped_candidates(aper, UNIT_SHAPE)
+        gated = aper._resolve_outside_weights(UNIT_SHAPE, method='exact',
+                                              subpixels=5,
+                                              candidates=candidates)
+        brute = _bruteforce_outside_weights(aper, UNIT_SHAPE, method='exact',
+                                            subpixels=5, candidates=candidates)
+
+        # The gated path returns the candidates unchanged.
+        assert_array_equal(gated, candidates)
+        # That exactly matches the explicit mask-based computation.
+        assert_array_equal(gated, brute)
+
+    def test_exact_copy(self):
+        """
+        Test that the gated 'exact' path returns a copy, not the input
+        candidates array.
+        """
+        aper = CircularAperture([(0.0, 12.0), (12.0, 12.0)], r=3.0)
+        candidates = _bbox_clipped_candidates(aper, UNIT_SHAPE)
+        w_out = aper._resolve_outside_weights(UNIT_SHAPE, method='exact',
+                                              subpixels=5,
+                                              candidates=candidates)
+        assert w_out is not candidates
+        assert_array_equal(w_out, candidates)

@@ -1,0 +1,6 @@
+{
+  "name": "SPHEREx Explorer",
+  "description": "Interactive spectrophotometry explorer for NASA's SPHEREx mission mapping the infrared universe across 102 continuous spectral bands.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

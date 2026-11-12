@@ -1,0 +1,52 @@
+# ==============================================================================
+# SPHEREx Target Regions Configuration
+#
+# Astronomical coordinates are in degrees (J2000 epoch):
+#   - ra_deg: Right Ascension (0° to 360°), like longitude on the sky
+#   - dec_deg: Declination (-90° to +90°), like latitude on the sky
+#   - size_arcmin: Size of the field to download in arcminutes (60 arcmin = 1 degree)
+#   - max_files: Maximum number of SPHEREx image files to download for this region
+#   - catalogue: Reference star catalogue to fetch (gaia_dr3 or allwise)
+#
+# You can freely edit coordinates, sizes, or file limits below.
+# ==============================================================================
+
+# Global download settings
+settings:
+  # Maximum total size of all downloads combined in Gigabytes
+  max_total_size_gb: 2.0
+  # Default maximum files per region
+  default_max_files: 120
+  # Archive release details
+  release: "QR2"
+  collection: "spherex_qr2"
+  doi: "10.26131/IRSA652"
+
+# Sky regions to download and cache
+regions:
+  - id: "north-ecliptic-pole"
+    name: "North Ecliptic Pole Deep Field (NEP)"
+    ra_deg: 270.3317
+    dec_deg: 66.5614
+    size_arcmin: 15.0
+    max_files: 120
+    catalogue: "gaia_dr3"
+    description: "Deep survey field scanned repeatedly by SPHEREx every orbit, optimal for high S/N ice studies."
+
+  - id: "south-ecliptic-pole"
+    name: "South Ecliptic Pole Deep Field (SEP)"
+    ra_deg: 90.0000
+    dec_deg: -66.5614
+    size_arcmin: 15.0
+    max_files: 120
+    catalogue: "gaia_dr3"
+    description: "Southern celestial pole region observed in dense scan patterns, overlapping with deep survey programs."
+
+  - id: "cosmos"
+    name: "COSMOS Extragalactic Field"
+    ra_deg: 150.1192
+    dec_deg: 2.2058
+    size_arcmin: 12.0
+    max_files: 120
+    catalogue: "allwise"
+    description: "Standard extragalactic benchmark field with low interstellar extinction, excellent for galaxy SED studies."

@@ -1,0 +1,82 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+"""
+Tests for the circle_overlap module.
+"""
+
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose
+
+from photutils.geometry import circular_overlap_grid
+
+grid_sizes = [50, 500, 1000]
+circ_sizes = [0.2, 0.4, 0.8]
+use_exacts = [0, 1]
+subsamples = [1, 5, 10]
+
+
+@pytest.mark.parametrize('grid_size', grid_sizes)
+@pytest.mark.parametrize('circ_size', circ_sizes)
+@pytest.mark.parametrize('use_exact', use_exacts)
+@pytest.mark.parametrize('subsample', subsamples)
+def test_circular_overlap_grid(grid_size, circ_size, use_exact, subsample):
+    """
+    Test normalization of the overlap grid to make sure that a fully
+    enclosed pixel has a value of 1.0.
+    """
+    g = circular_overlap_grid(-1.0, 1.0, -1.0, 1.0, grid_size, grid_size,
+                              circ_size, use_exact, subsample)
+    assert_allclose(g.max(), 1.0)
+
+
+@pytest.mark.parametrize('r', [0.3, 0.5, 1.7, 3.3])
+def test_circular_overlap_exact_total_area(r):
+    """
+    The exact-mode total overlap times the pixel area equals the
+    analytic circle area when the circle fits inside the grid.
+    """
+    grid = circular_overlap_grid(-5.0, 5.0, -5.0, 5.0, 100, 100, r, 1, 1)
+    pixel_area = (10.0 / 100) ** 2
+    assert_allclose(grid.sum() * pixel_area, np.pi * r ** 2, rtol=1e-12)
+
+
+def test_circular_overlap_exact_matches_high_subpixel():
+    """
+    The exact result should agree with a high subpixel approximation to
+    within the subpixel-sampling error.
+    """
+    args = (-2.0, 2.0, -2.0, 2.0, 20, 20, 1.3)
+    exact = circular_overlap_grid(*args, 1, 1)
+    sub = circular_overlap_grid(*args, 0, 64)
+    assert np.abs(exact - sub).max() < 0.02
+
+
+def test_circular_overlap_grid_validation():
+    """
+    Test that invalid use_exact and subpixels inputs raise errors.
+    """
+    match = 'use_exact must be 0 or 1'
+    with pytest.raises(ValueError, match=match):
+        circular_overlap_grid(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.5, 2, 5)
+
+    match = 'subpixels must be a strictly positive integer'
+    for subpixels in (0, -1):
+        with pytest.raises(ValueError, match=match):
+            circular_overlap_grid(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.5, 0,
+                                  subpixels)
+
+    # subpixels is ignored (not validated) for the exact method
+    g = circular_overlap_grid(-1.0, 1.0, -1.0, 1.0, 4, 4, 0.5, 1, 0)
+    assert np.isfinite(g).all()
+
+
+@pytest.mark.parametrize('use_exact', use_exacts)
+def test_circular_overlap_grid_no_readonly_inputs(use_exact):
+    """
+    Test that the scalar-input overlap grid function takes no array
+    inputs (so read-only input arrays cannot occur) and returns a
+    freshly allocated, writable output array of shape (ny, nx).
+    """
+    g = circular_overlap_grid(-5.0, 5.0, -5.0, 5.0, 10, 12, 3.0, use_exact, 5)
+    assert g.shape == (12, 10)
+    assert g.flags.writeable

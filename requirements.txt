@@ -1,0 +1,42 @@
+# ==============================================================================
+# SPHEREx Pipeline Python Dependencies
+# These libraries allow downloading astronomical images, querying star catalogues,
+# and analyzing scientific FITS files.
+# ==============================================================================
+
+# Core astronomy libraries for reading FITS files, coordinates, and WCS maps
+astropy>=6.0.0
+
+# Query tools to connect to Caltech/IPAC IRSA and other astronomical archives
+astroquery>=0.4.7
+
+# Virtual Observatory (VO) client for SIA v2 (image access) and TAP (catalogue queries)
+pyvo>=1.5.0
+
+# Scientific computing and array operations for pixel calculations
+numpy>=1.26.0
+
+# Astronomical photometry tools (aperture measurements, background subtraction)
+photutils>=1.11.0
+
+# HTTP networking library for downloading files and contacting web services
+requests>=2.31.0
+
+# Reads configuration files formatted in YAML (like pipeline/regions.yaml)
+pyyaml>=6.0.1
+
+# Progress bars in terminal while downloading or processing files
+tqdm>=4.66.0
+
+# Lightweight web API framework (for serving offline data locally in later phases)
+fastapi>=0.110.0
+uvicorn>=0.28.0
+
+# Image reprojection onto common celestial WCS grids
+reproject>=0.13.0
+
+# Image handling for exporting 8-bit PNGs
+pillow>=10.0.0
+
+# Testing framework for verifying code behavior
+pytest>=8.0.0

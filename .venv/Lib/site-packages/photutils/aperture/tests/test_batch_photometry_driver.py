@@ -1,0 +1,440 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+"""
+Tests for the low-level batch Cython aperture photometry driver.
+"""
+
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import pytest
+from numpy.testing import assert_allclose, assert_array_equal
+
+from photutils.aperture import (CircularAnnulus, CircularAperture,
+                                EllipticalAnnulus, EllipticalAperture,
+                                PolygonAperture, RectangularAnnulus,
+                                RectangularAperture)
+from photutils.aperture._batch_photometry import (FLAG_COL_BBOX_CLIPPED,
+                                                  FLAG_COL_N_PIXELS,
+                                                  SHAPE_CIRCLE,
+                                                  SHAPE_CIRCULAR_ANNULUS,
+                                                  SHAPE_ELLIPSE,
+                                                  SHAPE_ELLIPTICAL_ANNULUS,
+                                                  SHAPE_RECTANGLE,
+                                                  SHAPE_RECTANGULAR_ANNULUS,
+                                                  batch_aperture_sums)
+from photutils.aperture._common import batch_mask_plane
+
+N_THREADS = 8
+N_CALLS_PER_THREAD = 4
+
+
+def _batch_inputs():
+    """
+    Build deterministic data, error, mask, and source positions for the
+    batch-driver tests.
+    """
+    rng = np.random.default_rng(42)
+    data = rng.random((80, 80))
+    error = rng.random((80, 80)) + 0.1
+    mask = np.zeros((80, 80), dtype=np.uint8)
+    mask[::7, ::5] = 1
+    positions = np.array([[20.0, 25.0], [40.0, 40.0], [55.0, 30.0],
+                          [10.0, 60.0], [70.0, 70.0], [35.0, 15.0]])
+    return data, error, mask, positions
+
+
+# Aperture shape specs: (shape_code, params, ext_x, ext_y).
+# The half-extents need only bound the aperture. They are identical
+# across the baseline and concurrent calls, so the comparison is exact.
+_BATCH_SPECS = [
+    (SHAPE_CIRCLE, [8.0], 8.0, 8.0),
+    (SHAPE_CIRCULAR_ANNULUS, [5.0, 8.0], 8.0, 8.0),
+    (SHAPE_ELLIPSE, [8.0, 5.0, 0.7], 8.0, 8.0),
+    (SHAPE_ELLIPTICAL_ANNULUS, [4.0, 2.0, 8.0, 5.0, 0.7], 8.0, 8.0),
+    (SHAPE_RECTANGLE, [12.0, 7.0, 0.5], 7.0, 7.0),
+    (SHAPE_RECTANGULAR_ANNULUS, [6.0, 4.0, 12.0, 7.0, 0.5], 7.0, 7.0),
+]
+
+
+class TestBatchApertureSums:
+    """
+    Tests for the batch_aperture_sums Cython driver.
+    """
+
+    @pytest.mark.parametrize('use_exact', [1, 0])
+    def test_readonly_arrays(self, use_exact):
+        """
+        Test that the batch driver accepts read-only (nonwritable) data,
+        error, positions, and params arrays and returns results identical to
+        writable arrays.
+
+        The data, error, positions, and params arguments are declared as
+        ``const`` typed memoryviews so that read-only arrays do not raise a
+        ``ValueError``.
+        """
+        data, error, mask, positions = _batch_inputs()
+        params = np.array([8.0], dtype=np.float64)
+
+        expected = batch_aperture_sums(data, error, mask, positions,
+                                       SHAPE_CIRCLE, params, 8.0, 8.0,
+                                       0.0, 0.0, use_exact, 8)
+
+        for arr in (data, error, positions, params):
+            arr.setflags(write=False)
+        result = batch_aperture_sums(data, error, mask, positions,
+                                     SHAPE_CIRCLE, params, 8.0, 8.0,
+                                     0.0, 0.0, use_exact, 8)
+
+        for res_arr, exp_arr in zip(result, expected, strict=True):
+            assert_array_equal(res_arr, exp_arr)
+
+    @pytest.mark.parametrize(('shape_code', 'params', 'ext_x', 'ext_y'),
+                             _BATCH_SPECS)
+    @pytest.mark.parametrize('use_exact', [1, 0])
+    def test_threadsafe(self, shape_code, params, ext_x, ext_y, use_exact):
+        data, error, mask, positions = _batch_inputs()
+        params = np.array(params, dtype=np.float64)
+
+        def fn():
+            return batch_aperture_sums(data, error, mask, positions,
+                                       shape_code, params, ext_x, ext_y,
+                                       0.0, 0.0, use_exact, 8)
+
+        expected = fn()
+        with ThreadPoolExecutor(max_workers=N_THREADS) as ex:
+            futures = [ex.submit(fn)
+                       for _ in range(N_THREADS * N_CALLS_PER_THREAD)]
+            for future in futures:
+                result = future.result()
+                for res_arr, exp_arr in zip(result, expected, strict=True):
+                    assert_array_equal(res_arr, exp_arr)
+
+    def test_mixed_concurrent(self):
+        """
+        Run every aperture shape through the batch driver concurrently.
+
+        Mixing shapes within the thread pool surfaces interference between
+        calls if any shared mutable state (e.g., a module-level scratch
+        buffer) were introduced into the ``nogil`` source loop.
+        """
+        data, error, mask, positions = _batch_inputs()
+
+        def task(spec):
+            shape_code, params, ext_x, ext_y = spec
+            params = np.array(params, dtype=np.float64)
+            return batch_aperture_sums(data, error, mask, positions,
+                                       shape_code, params, ext_x, ext_y,
+                                       0.0, 0.0, 1, 5)
+
+        expected = {spec[0]: task(spec) for spec in _BATCH_SPECS}
+
+        with ThreadPoolExecutor(max_workers=N_THREADS) as ex:
+            futures = {ex.submit(task, spec): spec[0]
+                       for spec in _BATCH_SPECS for _ in range(N_THREADS)}
+            for fut, shape_code in futures.items():
+                result = fut.result()
+                for res_arr, exp_arr in zip(result, expected[shape_code],
+                                            strict=True):
+                    assert_array_equal(res_arr, exp_arr)
+
+
+def test_params_per_source_circle():
+    rng = np.random.default_rng(0)
+    data = rng.normal(size=(40, 40))
+    positions = np.array([[10.0, 10.0], [25.0, 25.0], [30.0, 12.0]])
+    radii = np.array([2.0, 3.5, 5.0])
+    psrc = radii[:, None].copy()
+    batch = batch_aperture_sums(
+        data, None, None, positions, SHAPE_CIRCLE, None, 0.0, 0.0,
+        0.0, 0.0, 1, 1, params_per_source=psrc)
+    for i, r in enumerate(radii):
+        single = batch_aperture_sums(
+            data, None, None, positions[i:i + 1], SHAPE_CIRCLE,
+            np.array([r]), r, r, 0.0, 0.0, 1, 1)
+        assert_allclose(batch[0][i], single[0][0], rtol=1e-12)
+
+
+def test_params_per_source_ellipse():
+    rng = np.random.default_rng(0)
+    data = rng.normal(size=(40, 40))
+    positions = np.array([[10.0, 10.0], [25.0, 25.0], [30.0, 12.0]])
+    psrc = np.array([[3.0, 2.0, 0.5],
+                     [4.0, 1.0, -0.3],
+                     [2.5, 2.5, 1.2]])
+    batch = batch_aperture_sums(
+        data, None, None, positions, SHAPE_ELLIPSE, None, 0.0, 0.0,
+        0.0, 0.0, 1, 1, params_per_source=psrc)
+    for i, (semi_a, semi_b, theta) in enumerate(psrc):
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+        ext_x = np.sqrt((semi_a * cos_theta)**2 + (semi_b * sin_theta)**2)
+        ext_y = np.sqrt((semi_a * sin_theta)**2 + (semi_b * cos_theta)**2)
+        single = batch_aperture_sums(
+            data, None, None, positions[i:i + 1], SHAPE_ELLIPSE,
+            np.array([semi_a, semi_b, theta]), ext_x, ext_y, 0.0, 0.0,
+            1, 1)
+        assert_allclose(batch[0][i], single[0][0], rtol=1e-12)
+
+
+def test_params_per_source_invalid():
+    data = np.ones((20, 20))
+    positions = np.array([[10.0, 10.0], [12.0, 12.0]])
+    psrc = np.array([[2.0], [3.0]])
+    params = np.array([2.0])
+
+    match = 'params must be given when params_per_source is None'
+    with pytest.raises(ValueError, match=match):
+        batch_aperture_sums(data, None, None, positions, SHAPE_CIRCLE,
+                            None, 2.0, 2.0, 0.0, 0.0, 1, 1)
+
+    match = 'give params or params_per_source, not both'
+    with pytest.raises(ValueError, match=match):
+        batch_aperture_sums(data, None, None, positions, SHAPE_CIRCLE,
+                            params, 2.0, 2.0, 0.0, 0.0, 1, 1,
+                            params_per_source=psrc)
+
+    match = 'params_per_source supports only circle and ellipse shapes'
+    with pytest.raises(ValueError, match=match):
+        batch_aperture_sums(data, None, None, positions,
+                            SHAPE_CIRCULAR_ANNULUS, None, 2.0, 2.0,
+                            0.0, 0.0, 1, 1, params_per_source=psrc)
+
+    match = 'params_per_source does not support emit_sum'
+    with pytest.raises(ValueError, match=match):
+        batch_aperture_sums(data, None, None, positions, SHAPE_CIRCLE,
+                            None, 2.0, 2.0, 0.0, 0.0, 1, 1, None, None,
+                            0, None, 1, params_per_source=psrc)
+
+    match = 'params_per_source must have one row per position'
+    with pytest.raises(ValueError, match=match):
+        batch_aperture_sums(data, None, None, positions, SHAPE_CIRCLE,
+                            None, 2.0, 2.0, 0.0, 0.0, 1, 1,
+                            params_per_source=psrc[:1])
+
+    match = 'params_per_source has the wrong column count'
+    with pytest.raises(ValueError, match=match):
+        batch_aperture_sums(data, None, None, positions, SHAPE_CIRCLE,
+                            None, 2.0, 2.0, 0.0, 0.0, 1, 1,
+                            params_per_source=np.zeros((2, 3)))
+    with pytest.raises(ValueError, match=match):
+        batch_aperture_sums(data, None, None, positions, SHAPE_ELLIPSE,
+                            None, 2.0, 2.0, 0.0, 0.0, 1, 1,
+                            params_per_source=np.zeros((2, 1)))
+
+
+def test_weights_out():
+    data = np.ones((20, 20))
+    positions = np.array([[10.0, 10.0],   # interior
+                          [1.0, 10.0],    # aperture off left edge
+                          [19.4, 10.0]])  # aperture off right edge
+    params = np.array([3.0])
+    result = batch_aperture_sums(
+        data, None, None, positions, SHAPE_CIRCLE, params, 3.0, 3.0,
+        0.0, 0.0, 1, 1)
+    weights_out = result.weights_out
+    assert list(weights_out) == [0, 1, 1]
+
+
+def test_weights_out_clipped_bbox_zero_weight():
+    """
+    Test that a bbox row can poke off-image while every off-image pixel
+    has zero aperture fraction.
+
+    ``weights_out`` must then be 0 even though ``FLAG_COL_BBOX_CLIPPED``
+    is 1. With method='center' (``use_exact=0``, ``subpixels=1``), a
+    circle of r=2.0 at y=1.4 has iymin = floor(1.4 - 2 + 0.5) = -1
+    (clipped), but the off-image pixel centers at y=-1 lie 2.4 > r from
+    the center, so their center-method fraction is zero.
+    """
+    data = np.ones((20, 20))
+    positions = np.array([[10.0, 1.4]])
+    params = np.array([2.0])
+    result = batch_aperture_sums(
+        data, None, None, positions, SHAPE_CIRCLE, params, 2.0, 2.0,
+        0.0, 0.0, 0, 1)
+    fcounts = result.flag_counts
+    weights_out = result.weights_out
+    assert fcounts[0, FLAG_COL_BBOX_CLIPPED] == 1
+    assert weights_out[0] == 0
+
+    # The same aperture with the exact method has positive area
+    # off-image
+    result = batch_aperture_sums(
+        data, None, None, positions, SHAPE_CIRCLE, params, 2.0, 2.0,
+        0.0, 0.0, 1, 1)
+    assert result.weights_out[0] == 1
+
+
+# Aperture factories (taking the positions) whose outside-weight
+# indicator is checked against the aperture's own mask at edge, corner,
+# interior, and off-image positions
+_OUTSIDE_WEIGHT_APERTURES = [
+    lambda pos: CircularAperture(pos, r=6.0),
+    lambda pos: CircularAnnulus(pos, r_in=3.0, r_out=6.0),
+    lambda pos: EllipticalAperture(pos, a=8.0, b=2.5, theta=0.7),
+    lambda pos: EllipticalAnnulus(pos, a_in=3.0, a_out=8.0, b_out=2.5,
+                                  theta=0.7),
+    lambda pos: RectangularAperture(pos, w=12.0, h=5.0, theta=0.5),
+    lambda pos: RectangularAnnulus(pos, w_in=5.0, w_out=12.0, h_out=5.0,
+                                   theta=0.5),
+    # A nonconvex (L-shaped) polygon
+    lambda pos: PolygonAperture(pos, [(-6, -6), (6, -6), (6, -1),
+                                      (-1, -1), (-1, 6), (-6, 6)]),
+]
+
+
+def _outside_weight_positions():
+    """
+    Positions on and just beyond every edge and corner of the 40x40
+    test data, plus interior and far off-image positions.
+    """
+    rng = np.random.default_rng(7)
+    edge = np.array([-8.0, -3.0, -0.4, 0.3, 2.0, 5.0, 37.0, 39.2, 39.6,
+                     42.0, 47.0])
+    positions = [(x, 20.0) for x in edge] + [(20.0, y) for y in edge]
+    positions += [(x, y) for x in (-3.0, 1.0, 38.0, 42.0)
+                  for y in (-3.0, 1.0, 38.0, 42.0)]
+    positions += [(20.0, 20.0), (12.5, 27.5), (200.0, 200.0),
+                  (-100.0, 20.0)]
+    positions += [tuple(rng.uniform(-10, 50, 2)) for _ in range(20)]
+    return np.array(positions, dtype=np.float64)
+
+
+@pytest.mark.parametrize('make_aperture', _OUTSIDE_WEIGHT_APERTURES,
+                         ids=lambda fn: type(fn((0, 0))).__name__)
+@pytest.mark.parametrize(('method', 'use_exact', 'subpixels'),
+                         [('exact', 1, 1), ('center', 0, 1),
+                          ('subpixel', 0, 3)])
+def test_weights_out_matches_mask(make_aperture, method, use_exact,
+                                  subpixels):
+    """
+    Test the outside-weight indicator against the aperture mask.
+
+    The reference is the aperture's own unclipped ``to_mask`` array
+    with the part inside the data zeroed. The indicator must be set
+    exactly when a nonzero mask value remains.
+    """
+    data = np.ones((40, 40))
+    positions = _outside_weight_positions()
+    aperture = make_aperture(positions)
+    shape_code, params = aperture._batch_shape_params()
+    ext_x, ext_y = aperture._xy_extents
+    off_x, off_y = aperture._xy_bbox_offset
+    result = batch_aperture_sums(
+        data, None, None, positions, shape_code,
+        np.array(params, dtype=np.float64), float(ext_x), float(ext_y),
+        float(off_x), float(off_y), use_exact, subpixels)
+
+    expected = np.zeros(len(positions), dtype=np.uint8)
+    clipped = np.zeros(len(positions), dtype=bool)
+    masks = aperture.to_mask(method=method, subpixels=subpixels)
+    for i, mask in enumerate(masks):
+        slc_lg, slc_sm = mask.get_overlap_slices(data.shape)
+        if slc_lg is None:
+            continue
+        bbox = mask.bbox
+        clipped[i] = (bbox.ixmin < 0 or bbox.iymin < 0
+                      or bbox.ixmax > data.shape[1]
+                      or bbox.iymax > data.shape[0])
+        outside = mask.data.copy()
+        outside[slc_sm] = 0.0
+        expected[i] = np.any(outside > 0)
+
+    assert_array_equal(result.flag_counts[:, FLAG_COL_BBOX_CLIPPED],
+                       clipped)
+    assert_array_equal(result.weights_out, expected)
+    assert np.any(expected[clipped] == 1)
+
+
+def test_weights_out_aperture_entirely_outside():
+    """
+    Test an aperture that lies entirely in the clipped-away part of its
+    bounding box.
+
+    The L-shaped polygon centered at (-3, -3) has its bounding box
+    overlapping the data but no area inside it, so the exact-method
+    ring test (which assumes weight on both sides of the data edge)
+    does not apply and every outside pixel is scanned instead.
+    """
+    data = np.ones((40, 40))
+    aperture = PolygonAperture((-3.0, -3.0), [(-6, -6), (6, -6), (6, -1),
+                                              (-1, -1), (-1, 6), (-6, 6)])
+    shape_code, params = aperture._batch_shape_params()
+    ext_x, ext_y = aperture._xy_extents
+    off_x, off_y = aperture._xy_bbox_offset
+    for use_exact, subpixels in ((1, 1), (0, 1), (0, 3)):
+        result = batch_aperture_sums(
+            data, None, None, np.array([[-3.0, -3.0]]), shape_code,
+            np.array(params, dtype=np.float64), float(ext_x),
+            float(ext_y), float(off_x), float(off_y), use_exact,
+            subpixels)
+        assert result.overlap[0]
+        assert result.flag_counts[0, FLAG_COL_BBOX_CLIPPED] == 1
+        assert result.flag_counts[0, FLAG_COL_N_PIXELS] == 0
+        assert result.weights_out[0] == 1
+
+
+@pytest.mark.parametrize(('use_exact', 'subpixels'),
+                         [(1, 1), (0, 1), (0, 3)])
+@pytest.mark.parametrize('radius', [2000.0, 8000.0, 20000.0])
+def test_weights_out_large_aperture(radius, use_exact, subpixels):
+    """
+    Test an aperture whose bounding box is far larger than the data.
+
+    The outside-weight test is separate from the accumulation loop and
+    stops at the first nonzero-fraction pixel outside the data (for the
+    exact method it tests only the ring of pixels just outside the data
+    edges), so the cost of these apertures does not grow with the
+    (enormous) bounding-box area.
+    """
+    data = np.ones((200, 200))
+    positions = np.array([[100.0, 100.0]])
+    result = batch_aperture_sums(
+        data, None, None, positions, SHAPE_CIRCLE, np.array([radius]),
+        radius, radius, 0.0, 0.0, use_exact, subpixels)
+
+    assert result.weights_out[0] == 1
+    assert result.flag_counts[0, FLAG_COL_BBOX_CLIPPED] == 1
+    # Every data pixel is well inside the aperture, so the sums are
+    # unaffected by the outside-weight scan
+    assert result.flag_counts[0, FLAG_COL_N_PIXELS] == data.size
+    assert_allclose(result.sums[0], data.sum())
+    assert_allclose(result.areas[0], data.size)
+
+
+class TestBatchMaskPlane:
+    """
+    Tests for the uint8 mask plane passed to the batch drivers.
+    """
+
+    def test_none(self):
+        assert batch_mask_plane(None) is None
+
+    def test_contiguous_mask_is_view(self):
+        """
+        Test that a C-contiguous boolean mask is viewed without a copy.
+        """
+        mask = np.zeros((20, 30), dtype=bool)
+        mask[3, 4] = True
+        plane = batch_mask_plane(mask)
+        assert plane.dtype == np.uint8
+        assert plane.flags.c_contiguous
+        assert plane.shape == mask.shape
+        assert np.shares_memory(plane, mask)
+        assert plane[3, 4] == 1
+        assert plane.sum() == 1
+
+    def test_noncontiguous_mask_is_copied(self):
+        """
+        Test that a noncontiguous boolean mask is copied into a
+        C-contiguous plane with the same values.
+        """
+        mask = np.zeros((40, 60), dtype=bool)
+        mask[6, 8] = True
+        view = mask[::2, ::2]
+        assert not view.flags.c_contiguous
+        plane = batch_mask_plane(view)
+        assert plane.dtype == np.uint8
+        assert plane.flags.c_contiguous
+        assert not np.shares_memory(plane, mask)
+        assert_array_equal(plane, view.astype(np.uint8))

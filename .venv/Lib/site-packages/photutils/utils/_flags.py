@@ -1,0 +1,421 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+"""
+Generic machinery for defining and decoding bitwise quality flags.
+
+This private module provides the shared building blocks used by the
+public per-package flag registries (e.g., ``photutils.psf.flags`` and
+``photutils.aperture.flags``): a flag-definition dataclass, a registry
+base class, a flag decoder, and a docstring-substitution helper.
+"""
+
+import re
+import warnings
+from dataclasses import dataclass
+from typing import ClassVar
+
+import numpy as np
+
+from photutils.utils._deprecation import deprecated_getattr
+from photutils.utils.exceptions import PhotutilsDeprecationWarning
+
+__all__ = []
+
+
+@dataclass(frozen=True)
+class FlagDefinition:
+    """
+    A single bitwise flag definition.
+
+    Attributes
+    ----------
+    bit_value : int
+        The bit value (power of 2) for this flag.
+
+    name : str
+        Short name for the flag (used by the flag decoders).
+
+    description : str
+        Brief description of what this flag indicates.
+
+    detailed_description : str
+        Detailed description for use in docstrings.
+    """
+
+    bit_value: int
+    name: str
+    description: str
+    detailed_description: str
+
+
+class FlagRegistry:
+    """
+    Base class for centralized definitions of bitwise quality flags.
+
+    Subclasses define the ``FLAG_DEFINITIONS`` list of `FlagDefinition`
+    objects and a short ``domain`` string identifying the flag source
+    (e.g., ``'psf'`` or ``'aperture'``). The registry provides a single
+    source of truth for the flag bit values, names, and descriptions,
+    enabling consistent flag handling and dynamic docstring generation.
+
+    Uppercase constants (e.g., ``NO_OVERLAP``) are created on the
+    instance for each flag definition.
+    """
+
+    FLAG_DEFINITIONS: ClassVar = []
+    domain: ClassVar = ''
+
+    # Mapping of deprecated flag names to their new names, along with
+    # the deprecation versions used in the warning messages.
+    # _DEPRECATED_SINCE maps each deprecated flag name to the version
+    # in which it was deprecated and must have an entry for every
+    # deprecated name. The deprecated constant names are the uppercase
+    # flag names and are derived from _DEPRECATED_FLAG_NAMES.
+    _DEPRECATED_FLAG_NAMES: ClassVar = {}
+    _DEPRECATED_CONSTANT_NAMES: ClassVar = {}
+    _DEPRECATED_SINCE: ClassVar = {}
+    _DEPRECATED_UNTIL: ClassVar = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        missing = set(cls._DEPRECATED_FLAG_NAMES) - set(cls._DEPRECATED_SINCE)
+        if missing:
+            msg = (f'{cls.__name__}._DEPRECATED_SINCE is missing the '
+                   f'deprecated flag names {sorted(missing)}')
+            raise ValueError(msg)
+        cls._DEPRECATED_CONSTANT_NAMES = {
+            old.upper(): new.upper()
+            for old, new in cls._DEPRECATED_FLAG_NAMES.items()}
+
+    def __init__(self):
+        for flag_def in self.FLAG_DEFINITIONS:
+            # Create uppercase constants (e.g., NO_OVERLAP = 1)
+            setattr(self, flag_def.name.upper(), flag_def.bit_value)
+
+        # Create lookup dictionaries for efficient access
+        self._bit_to_def = {fd.bit_value: fd
+                            for fd in self.FLAG_DEFINITIONS}
+        self._name_to_def = {fd.name: fd for fd in self.FLAG_DEFINITIONS}
+
+    def __getattr__(self, name):
+        return deprecated_getattr(self, name,
+                                  self._DEPRECATED_CONSTANT_NAMES,
+                                  since=self._DEPRECATED_SINCE.get(
+                                      name.lower()),
+                                  until=self._DEPRECATED_UNTIL)
+
+    @property
+    def all_flags(self):
+        """
+        Return all flag definitions.
+        """
+        return self.FLAG_DEFINITIONS.copy()
+
+    @property
+    def bit_values(self):
+        """
+        Return all bit values.
+        """
+        return [fd.bit_value for fd in self.FLAG_DEFINITIONS]
+
+    @property
+    def names(self):
+        """
+        Return all flag names.
+        """
+        return [fd.name for fd in self.FLAG_DEFINITIONS]
+
+    @property
+    def flag_dict(self):
+        """
+        Return dictionary mapping bit values to names.
+        """
+        return {fd.bit_value: fd.name for fd in self.FLAG_DEFINITIONS}
+
+    def get_definition(self, identifier):
+        """
+        Get flag definition by bit value or name.
+
+        Parameters
+        ----------
+        identifier : int or str
+            Either the bit value (int) or name (str) of the flag.
+
+        Returns
+        -------
+        definition : `FlagDefinition`
+            The flag definition.
+
+        Raises
+        ------
+        KeyError
+            If the identifier is not found.
+
+        TypeError
+            If the identifier is not an integer or a string. A `bool`
+            is not accepted.
+        """
+        if isinstance(identifier, (int, np.integer)) and not isinstance(
+                identifier, bool):
+            identifier = int(identifier)
+            if identifier not in self._bit_to_def:
+                msg = f'No flag with bit value {identifier}'
+                raise KeyError(msg)
+            return self._bit_to_def[identifier]
+
+        if isinstance(identifier, str):
+            if identifier in self._DEPRECATED_FLAG_NAMES:
+                new_name = self._DEPRECATED_FLAG_NAMES[identifier]
+                since = self._DEPRECATED_SINCE[identifier]
+                warnings.warn(
+                    f"The flag name '{identifier}' is deprecated "
+                    f"in version {since}. Use "
+                    f"'{new_name}' instead. It will be removed in "
+                    f'version {self._DEPRECATED_UNTIL}.',
+                    PhotutilsDeprecationWarning,
+                    stacklevel=2,
+                )
+                identifier = new_name
+
+            if identifier not in self._name_to_def:
+                msg = f"No flag with name '{identifier}'"
+                raise KeyError(msg)
+            return self._name_to_def[identifier]
+
+        msg = 'identifier must be int (bit value) or str (name)'
+        raise TypeError(msg)
+
+    def get_name(self, bit_value):
+        """
+        Get flag name from bit value.
+
+        Parameters
+        ----------
+        bit_value : int
+            The bit value of the flag.
+
+        Returns
+        -------
+        name : str
+            The name of the flag.
+        """
+        return self.get_definition(bit_value).name
+
+    def get_bit_value(self, name):
+        """
+        Get flag bit value from name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the flag.
+
+        Returns
+        -------
+        bit_value : int
+            The bit value of the flag.
+        """
+        return self.get_definition(name).bit_value
+
+    def get_description(self, bit_value):
+        """
+        Get flag description from bit value.
+
+        Parameters
+        ----------
+        bit_value : int
+            The bit value of the flag.
+
+        Returns
+        -------
+        description : str
+            The brief description of the flag.
+        """
+        return self.get_definition(bit_value).description
+
+    def get_detailed_description(self, bit_value):
+        """
+        Get detailed flag description from bit value.
+
+        Parameters
+        ----------
+        bit_value : int
+            The bit value of the flag.
+
+        Returns
+        -------
+        detailed_description : str
+            The detailed description of the flag.
+        """
+        return self.get_definition(bit_value).detailed_description
+
+
+def define_flag_docstring(registry, *, indent=0):
+    """
+    Generate a bullet list of flag names, bit values, and descriptions.
+
+    Parameters
+    ----------
+    registry : `FlagRegistry`
+        The flag registry providing the flag definitions.
+
+    indent : int, optional
+        Number of spaces to indent the bullet list.
+
+    Returns
+    -------
+    flag_descriptions : list of str
+        The lines of the bullet list. The first element is an empty
+        string, followed by a "No flags set" bullet for 0 and one bullet
+        per flag giving its bit value, name, and detailed description.
+    """
+    if not isinstance(registry, FlagRegistry):
+        msg = 'registry must be an instance of FlagRegistry'
+        raise TypeError(msg)
+
+    indent_str = ' ' * indent
+
+    # Generate the flag descriptions
+    flag_descriptions = ['', f'{indent_str}* **0** : No flags set.']
+
+    for flag_def in registry.FLAG_DEFINITIONS:
+        name = flag_def.name
+        bit_val = flag_def.bit_value
+        desc = flag_def.detailed_description
+        line = f"{indent_str}* **{bit_val}** (``'{name}'``) : {desc}"
+        flag_descriptions.append(line)
+
+    return flag_descriptions
+
+
+def update_flag_docstring(func, registry, *, indent=0,
+                          placeholder='<flag_descriptions>'):
+    """
+    Update a function docstring with flag documentation.
+
+    The ``placeholder`` text in the function docstring is replaced with
+    a bullet list of the flag bit values, names, and detailed
+    descriptions generated from the ``registry``.
+
+    Parameters
+    ----------
+    func : function
+        The function whose docstring is updated in place.
+
+    registry : `FlagRegistry`
+        The flag registry providing the flag definitions.
+
+    indent : int or None, optional
+        Number of spaces to indent the bullet list. If `None`, the
+        placeholder must appear alone on its own line, and the leading
+        indentation of that line is applied to the bullet list. This
+        keeps the list aligned with the surrounding text on all Python
+        versions, including Python 3.13+, which strips the common
+        leading whitespace from docstrings at compile time.
+
+    placeholder : str, optional
+        The placeholder text to replace in the docstring.
+
+    Returns
+    -------
+    func : function
+        The function with an updated docstring.
+    """
+    if not hasattr(func, '__doc__') or func.__doc__ is None:
+        return func
+
+    docstring = func.__doc__
+
+    if indent is None:
+        pattern = re.compile(rf'^([ \t]*){re.escape(placeholder)}[ \t]*$',
+                             re.MULTILINE)
+
+        def replace(match):
+            flag_descriptions = define_flag_docstring(
+                registry, indent=len(match.group(1)))
+            return '\n'.join(flag_descriptions)
+
+        func.__doc__ = pattern.sub(replace, docstring)
+        return func
+
+    if placeholder in docstring:
+        flag_descriptions = define_flag_docstring(registry, indent=indent)
+
+        # Replace the placeholder with the flag descriptions
+        flag_text = '\n'.join(flag_descriptions)
+        func.__doc__ = docstring.replace(placeholder, flag_text)
+
+    return func
+
+
+def decode_flags(flags, registry, *, return_bit_values=False):
+    """
+    Decode bitwise flag values into individual components.
+
+    Parameters
+    ----------
+    flags : int or array-like of int
+        Integer flag value(s) to decode.
+
+    registry : `FlagRegistry`
+        The flag registry providing the flag definitions.
+
+    return_bit_values : bool, optional
+        If `True`, return the decoded bit flags (integers) instead of
+        the flag names (strings).
+
+    Returns
+    -------
+    decoded : list
+        List of active flag names (or bit values) for a scalar input.
+        For an array input, a nested list with the same shape as the
+        input is returned, where each innermost element is the list of
+        active flag names (or bit values) for the corresponding flag.
+    """
+    flag_definitions = registry.flag_dict
+
+    def _decode_single_flag(flag_value):
+        """
+        Decode a single integer flag value.
+        """
+        if (not isinstance(flag_value, (int, np.integer))
+                or isinstance(flag_value, bool)):
+            msg = 'Flag value must be an integer'
+            raise TypeError(msg)
+
+        if flag_value < 0:
+            msg = 'Flag value must be a nonnegative integer'
+            raise ValueError(msg)
+
+        # A NumPy integer cannot be compared with a bit value that is
+        # out of bounds for its dtype
+        flag_value = int(flag_value)
+        active_flags = []
+        for bit_value, name in flag_definitions.items():
+            if flag_value & bit_value:
+                if return_bit_values:
+                    active_flags.append(bit_value)
+                else:
+                    active_flags.append(name)
+        return active_flags
+
+    def _decode_array(arr):
+        """
+        Recursively decode an array, preserving its shape as nested
+        lists.
+        """
+        if arr.ndim == 1:
+            return [_decode_single_flag(flag) for flag in arr]
+        return [_decode_array(sub) for sub in arr]
+
+    # Handle both single values and arrays
+    if np.isscalar(flags):
+        return _decode_single_flag(flags)
+
+    # Convert to numpy array for consistent handling
+    flags_array = np.asarray(flags)
+    if flags_array.ndim == 0:
+        # Handle 0D arrays (scalar arrays)
+        return _decode_single_flag(flags_array.item())
+
+    # Handle 1D or higher dimensional arrays, preserving shape
+    return _decode_array(flags_array)

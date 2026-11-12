@@ -1,0 +1,499 @@
+# Licensed under a 3-clause BSD style license - see LICENSE.rst
+"""
+Helpers shared by the aperture photometry and statistics classes.
+
+The `~photutils.aperture.AperturePhotometry` and
+`~photutils.aperture.ApertureStats` classes accept the same ``data``,
+``error``, ``mask``, and ``wcs`` inputs and present their per-source
+results with the same scalar-collapse convention. Both also feed the
+same batch Cython drivers. The shared logic lives here so that the two
+code paths cannot silently diverge.
+"""
+
+import warnings
+from typing import NamedTuple
+
+import astropy.units as u
+import numpy as np
+from astropy.coordinates import SkyCoord
+from astropy.nddata import StdDevUncertainty
+from astropy.utils.exceptions import AstropyUserWarning
+
+from photutils.aperture._segmentation import (SEG_METHOD_CODES,
+                                              batch_segmentation_image)
+
+__all__ = []
+
+
+# Types of the public per-source attributes that are collapsed to a
+# scalar for a scalar instance (see ``collapse_scalar_value``).
+SCALAR_COLLAPSE_TYPES = (np.ndarray, SkyCoord, list, tuple)
+
+
+def unpack_nddata(data, error, mask, wcs):
+    """
+    Extract the data, error, mask, and WCS from a
+    `~astropy.nddata.NDData` object.
+
+    A warning is emitted for each of the ``error``, ``mask``, and
+    ``wcs`` keywords that was also input directly, because the
+    `~astropy.nddata.NDData` attributes take precedence.
+
+    Parameters
+    ----------
+    data : `~astropy.nddata.NDData`
+        The NDData object.
+
+    error, mask, wcs : object
+        The values input directly by the user. These are ignored and
+        are used only to emit the warnings.
+
+    Returns
+    -------
+    data : `~numpy.ndarray` or `~astropy.units.Quantity`
+        The NDData data array, as a Quantity if it has units.
+
+    error : `~numpy.ndarray`, `~astropy.units.Quantity`, or `None`
+        The standard-deviation uncertainty array, or `None` if the
+        NDData uncertainty is not a
+        `~astropy.nddata.StdDevUncertainty`.
+
+    mask : `~numpy.ndarray` or `None`
+        The NDData mask.
+
+    wcs : WCS object or `None`
+        The NDData WCS.
+    """
+    nddata_attr = {'error': error, 'mask': mask, 'wcs': wcs}
+    for key, value in nddata_attr.items():
+        if value is not None:
+            msg = (f'The {key!r} keyword is ignored. Its value '
+                   'is obtained from the input NDData object.')
+            warnings.warn(msg, AstropyUserWarning)
+
+    mask = data.mask
+    wcs = data.wcs
+
+    error = None
+    if isinstance(data.uncertainty, StdDevUncertainty):
+        if data.uncertainty.unit is None:
+            error = data.uncertainty.array
+        else:
+            error = data.uncertainty.array * data.uncertainty.unit
+
+    if data.unit is not None:
+        data = u.Quantity(data.data, unit=data.unit)
+    else:
+        data = data.data
+
+    return data, error, mask, wcs
+
+
+def validate_array(array, name, *, ndim=2, shape=None):
+    """
+    Validate the dimensionality and shape of an input array.
+
+    Parameters
+    ----------
+    array : array_like or `None`
+        The array to validate. `None` is returned unchanged. For a
+        mask, `numpy.ma.nomask` is converted to `None`.
+
+    name : str
+        The name of the array, used in the error messages.
+
+    ndim : int, optional
+        The required number of dimensions.
+
+    shape : tuple of int or `None`, optional
+        The required shape. If `None`, the shape is not checked.
+
+    Returns
+    -------
+    array : `~numpy.ndarray` or `None`
+        The input array as an ndarray (subclasses are preserved), or
+        `None`.
+    """
+    if name == 'mask' and array is np.ma.nomask:
+        array = None
+    if array is not None:
+        array = np.asanyarray(array)
+        if array.ndim != ndim:
+            msg = f'{name} must be a {ndim}D array'
+            raise ValueError(msg)
+        if shape is not None and array.shape != shape:
+            msg = f'data and {name} must have the same shape'
+            raise ValueError(msg)
+    return array
+
+
+def collapse_scalar_value(value):
+    """
+    Collapse the leading length-1 (source) axis of a per-source value.
+
+    Parameters
+    ----------
+    value : object
+        The per-source value.
+
+    Returns
+    -------
+    value : object
+        The first element of ``value`` if it has a leading length-1
+        axis, otherwise ``value`` unchanged.
+    """
+    try:
+        if len(value) == 1:
+            return value[0]
+    except TypeError:  # value has no len
+        pass
+    return value
+
+
+def validate_mask_method(method, subpixels, *, method_name='mask method'):
+    """
+    Validate the aperture-mask method and subpixels keywords.
+
+    Parameters
+    ----------
+    method : {'exact', 'center', 'subpixel'}
+        The aperture-mask method.
+
+    subpixels : int
+        The subsampling factor per axis used when
+        ``method='subpixel'``. It is not validated for the other
+        methods, which ignore it.
+
+    method_name : str, optional
+        The name of the method keyword, used in the error message.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not one of ``'exact'``, ``'center'``, or
+        ``'subpixel'``, or if ``subpixels`` is not a strictly positive
+        integer when ``method='subpixel'``.
+    """
+    if method not in ('center', 'subpixel', 'exact'):
+        msg = f'Invalid {method_name}: {method!r}'
+        raise ValueError(msg)
+
+    # bool is a subclass of int, so it is rejected explicitly to
+    # prevent subpixels=True from being silently used as 1
+    if ((method == 'subpixel')
+            and (isinstance(subpixels, bool)
+                 or not isinstance(subpixels, (int, np.integer))
+                 or subpixels <= 0)):
+        msg = 'subpixels must be a strictly positive integer'
+        raise ValueError(msg)
+
+
+def batch_array_supported(array):
+    """
+    Whether an array has a dtype supported by the batch Cython drivers.
+
+    Parameters
+    ----------
+    array : object
+        The array to test.
+
+    Returns
+    -------
+    supported : bool
+        `True` if the array is a plain `~numpy.ndarray` with a
+        floating-point, integer, or boolean dtype of at most 8 bytes.
+    """
+    return (type(array) is np.ndarray and array.dtype.kind in 'fiub'
+            and array.dtype.itemsize <= 8)
+
+
+def batch_inputs_supported(data, error, mask):
+    """
+    Whether the data, error, and mask arrays are supported by the batch
+    Cython drivers.
+
+    Parameters
+    ----------
+    data : object
+        The data array.
+
+    error : object or `None`
+        The error array.
+
+    mask : object or `None`
+        The boolean mask array.
+
+    Returns
+    -------
+    supported : bool
+        `True` if all of the input arrays are supported, in which case
+        the batch code path can be used. Otherwise `False`, and the
+        caller must use the mask-based code path.
+    """
+    if not batch_array_supported(data):
+        return False
+    if error is not None and not batch_array_supported(error):
+        return False
+    return not (mask is not None
+                and (not isinstance(mask, np.ndarray)
+                     or mask.dtype != bool
+                     or mask.shape != data.shape))
+
+
+def batch_image_dtype(*arrays):
+    """
+    Return the common dtype in which the batch Cython drivers read the
+    image arrays.
+
+    The drivers read C-contiguous float32 or float64 images directly,
+    converting each pixel value to double as it is read. That
+    conversion is exact, so the results agree to within rounding for
+    either dtype. All of the images passed to a driver must have the
+    same dtype.
+
+    Parameters
+    ----------
+    *arrays : `~numpy.ndarray` or `None`
+        The image arrays. `None` values are ignored.
+
+    Returns
+    -------
+    dtype : type
+        `numpy.float32` if all of the input arrays are floating-point
+        arrays of at most 4 bytes per value (e.g., float32, big-endian
+        float32 data read from a FITS file, or float16), whose values
+        are exactly representable in float32. Otherwise
+        `numpy.float64`.
+    """
+    if all(array.dtype.kind == 'f' and array.dtype.itemsize <= 4
+           for array in arrays if array is not None):
+        return np.float32
+    return np.float64
+
+
+def batch_image_arrays(*arrays):
+    """
+    Return the image arrays in the form read by the batch Cython
+    drivers (see `batch_image_dtype`).
+
+    Parameters
+    ----------
+    *arrays : `~numpy.ndarray` or `None`
+        The image arrays. `None` values are passed through.
+
+    Returns
+    -------
+    result : list of `~numpy.ndarray` or `None`
+        The C-contiguous arrays in their common dtype. Arrays that are
+        already C-contiguous with that dtype are returned without a
+        copy.
+    """
+    dtype = batch_image_dtype(*arrays)
+    return [None if array is None
+            else np.ascontiguousarray(array, dtype=dtype)
+            for array in arrays]
+
+
+def batch_mask_plane(mask):
+    """
+    Build the uint8 mask plane used by the batch Cython kernels.
+
+    Bit 1 (value 1) marks input-masked pixels. Nonfinite ``data``
+    pixels are not marked in the plane. The kernels test them per pixel
+    (their ``mask_nonfinite`` argument), so no full-image pass is
+    needed.
+
+    Parameters
+    ----------
+    mask : `~numpy.ndarray` (bool) or `None`
+        The input mask.
+
+    Returns
+    -------
+    plane : `~numpy.ndarray` (uint8) or `None`
+        The C-contiguous mask plane, or `None` if there is no input
+        mask. The plane is a view of a C-contiguous input mask (no
+        copy is made).
+
+    Notes
+    -----
+    The plane is a byte view, so the bytes of the input mask are not
+    normalized to 0 and 1. An ill-formed boolean array whose storage
+    holds other byte values (e.g., a uint8 array viewed as bool)
+    excludes the same pixels, but the kernels interpret its bytes as
+    plane bits, so such a pixel can be counted as nonfinite (bit 2)
+    rather than as masked (bit 1). Boolean arrays created by NumPy
+    always hold 0 or 1.
+    """
+    if mask is None:
+        return None
+    # A boolean array stores one byte (0 or 1) per element, so it can
+    # be viewed as uint8 without a copy.
+    return np.ascontiguousarray(mask).view(np.uint8)
+
+
+def batch_segmentation_arrays(segmentation, labels, mask_method):
+    """
+    Build the segmentation inputs for the batch Cython kernels.
+
+    Parameters
+    ----------
+    segmentation : `~numpy.ndarray` or `None`
+        The validated segmentation array.
+
+    labels : `~numpy.ndarray` or `None`
+        The per-aperture source labels.
+
+    mask_method : {'none', 'mask', 'source_only', 'background_only', \
+            'correct'}
+        The segmentation masking method.
+
+    Returns
+    -------
+    segmentation, labels : `~numpy.ndarray` or `None`
+        The C-contiguous segmentation array (see
+        `batch_segmentation_image`) and intp source labels, or `None`
+        if no segmentation masking is performed.
+
+    method_code : int
+        The segmentation method code (0 disables masking).
+    """
+    if segmentation is None or mask_method == 'none':
+        return None, None, 0
+
+    return (batch_segmentation_image(segmentation),
+            np.ascontiguousarray(labels, dtype=np.intp),
+            SEG_METHOD_CODES[mask_method])
+
+
+class BatchInputs(NamedTuple):
+    """
+    The inputs of the batch Cython drivers for one aperture and image
+    (see `batch_driver_inputs`).
+
+    The field names match the corresponding parameters of
+    `~photutils.aperture._batch_photometry.batch_aperture_sums`.
+    """
+
+    data: np.ndarray
+    """The C-contiguous data array."""
+
+    error: np.ndarray | None
+    """The C-contiguous error array, with the same dtype as the
+    data."""
+
+    mask: np.ndarray | None
+    """The uint8 mask plane (see `batch_mask_plane`)."""
+
+    positions: np.ndarray
+    """The ``(n_sources, 2)`` float64 aperture positions."""
+
+    shape_code: int
+    """The aperture shape code."""
+
+    params: np.ndarray
+    """The float64 aperture shape parameters."""
+
+    ext_x: float
+    """The half-extent of the aperture bounding box along x."""
+
+    ext_y: float
+    """The half-extent of the aperture bounding box along y."""
+
+    off_x: float
+    """The x offset of the bounding-box center from the position."""
+
+    off_y: float
+    """The y offset of the bounding-box center from the position."""
+
+    use_exact: int
+    """Whether the exact overlap method is used (1) or not (0)."""
+
+    subpixels: int
+    """The number of subpixels of the subpixel overlap method."""
+
+    segmentation: np.ndarray | None
+    """The C-contiguous segmentation array."""
+
+    labels: np.ndarray | None
+    """The intp source label of each aperture."""
+
+    seg_method: int
+    """The segmentation method code (0 disables masking)."""
+
+
+def batch_driver_inputs(aperture, data, *, error, mask, method, subpixels,
+                        segmentation, labels, mask_method):
+    """
+    Build the inputs of the batch Cython drivers for a pixel aperture.
+
+    Parameters
+    ----------
+    aperture : `~photutils.aperture.PixelAperture`
+        The pixel aperture.
+
+    data : `~numpy.ndarray`
+        The 2D data array, with any units already stripped.
+
+    error : `~numpy.ndarray` or `None`
+        The 2D error array, with any units already stripped.
+
+    mask : `~numpy.ndarray` (bool) or `None`
+        The input mask.
+
+    method : {'exact', 'center', 'subpixel'}
+        The aperture mask method.
+
+    subpixels : int
+        The number of subpixels for the ``'subpixel'`` method.
+
+    segmentation : `~numpy.ndarray` or `None`
+        The validated segmentation array.
+
+    labels : `~numpy.ndarray` or `None`
+        The per-aperture source labels.
+
+    mask_method : {'none', 'mask', 'source_only', 'background_only', \
+            'correct'}
+        The segmentation masking method.
+
+    Returns
+    -------
+    inputs : `BatchInputs` or `None`
+        The driver inputs, or `None` if the batch drivers do not
+        support this aperture or these input arrays (see
+        `batch_inputs_supported`). In that case the caller must use the
+        mask-based code path.
+    """
+    # Use the batch drivers only if the aperture's own class opted
+    # in via the _enable_batch_photometry decorator. Undecorated
+    # subclasses may override other behavior (e.g., to_mask) that the
+    # batch drivers would not honor, so they use the mask-based code
+    # path.
+    if type(aperture)._batch_photometry_class is not type(aperture):
+        return None
+
+    spec = aperture._batch_shape_params()
+    if spec is None:
+        return None
+
+    if not batch_inputs_supported(data, error, mask):
+        return None
+
+    seg_arr, labels_arr, seg_code = batch_segmentation_arrays(
+        segmentation, labels, mask_method)
+    use_exact, subpixels = aperture._translate_mask_method(method, subpixels)
+    shape_code, params = spec
+    ext_x, ext_y = aperture._xy_extents
+    off_x, off_y = aperture._xy_bbox_offset
+    data, error = batch_image_arrays(data, error)
+
+    positions = np.ascontiguousarray(aperture._positions, dtype=np.float64)
+    params = np.array(params, dtype=np.float64)
+
+    # The fields are passed by position, in the `BatchInputs` field
+    # order.
+    return BatchInputs(data, error, batch_mask_plane(mask), positions,
+                       shape_code, params, float(ext_x), float(ext_y),
+                       float(off_x), float(off_y), use_exact, subpixels,
+                       seg_arr, labels_arr, seg_code)

@@ -1,0 +1,17 @@
+{
+  "mission": "NASA SPHEREx (Spectro-Photometer for the History of the Universe, Epoch of Reionization, and Ices Explorer)",
+  "release": "QR2",
+  "doi": "10.26131/IRSA652",
+  "archive_host": "Caltech / IPAC Infrared Science Archive (IRSA)",
+  "catalogue_services": {
+    "gaia_dr3": "https://gea.esac.esa.int/tap-server/tap",
+    "allwise": "https://irsa.ipac.caltech.edu/TAP"
+  },
+  "generated_timestamp_utc": "2026-11-10T04:27:47.353543+00:00",
+  "summary": {
+    "total_real_files": 0,
+    "total_fixtures": 0
+  },
+  "real_files": [],
+  "fixtures": []
+}

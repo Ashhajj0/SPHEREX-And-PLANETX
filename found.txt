@@ -1,0 +1,147 @@
+﻿
+  src\components\ExplorerPage.tsx:110:  const [dragStart, setDragStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  src\components\ExplorerPage.tsx:111:
+> src\components\ExplorerPage.tsx:112:  // Suspect points toggle (default on)
+  src\components\ExplorerPage.tsx:113:  const [showSuspectPoints, setShowSuspectPoints] = useState<boolean>(true);
+  src\components\ExplorerPage.tsx:114:
+  src\components\ExplorerPage.tsx:115:  // Inspector tab: 'spectrum' | 'match' | 'sources'
+  src\components\ExplorerPage.tsx:116:  const [activeInspectorTab, setActiveInspectorTab] = useState<'spectrum' | 'match' | 'sources'>('spectrum');
+  src\components\ExplorerPage.tsx:117:  const [isLogY, setIsLogY] = useState<boolean>(true);
+  src\components\ExplorerPage.tsx:118:  const [hoveredPoint, setHoveredPoint] = useState<RealSpectrumPoint | null>(null);
+  src\components\ExplorerPage.tsx:119:  const [hoveredSourceId, setHoveredSourceId] = useState<string | null>(null);
+  src\components\ExplorerPage.tsx:120:
+  src\components\ExplorerPage.tsx:579:  }, [minFlux, maxFlux, isLogY]);
+  src\components\ExplorerPage.tsx:580:
+> src\components\ExplorerPage.tsx:581:  // Connecting line segments ONLY between consecutive valid, non-suspect points of the SAME detector
+  src\components\ExplorerPage.tsx:582:  const connectingSegments = useMemo(() => {
+  src\components\ExplorerPage.tsx:583:    const segments: Array<{ d: string; color: string }> = [];
+  src\components\ExplorerPage.tsx:584:    let prev: RealSpectrumPoint | null = null;
+  src\components\ExplorerPage.tsx:585:
+  src\components\ExplorerPage.tsx:586:    for (const pt of currentSpectrum) {
+  src\components\ExplorerPage.tsx:587:      const isValid = pt.flux_uJy !== null && pt.wavelength_um !== null;
+  src\components\ExplorerPage.tsx:588:      const isSuspect = pt.quality === 'suspect';
+  src\components\ExplorerPage.tsx:589:
+  src\components\ExplorerPage.tsx:1023:                  )}
+  src\components\ExplorerPage.tsx:1024:
+> src\components\ExplorerPage.tsx:1025:                  {/* Connecting Line Segments (ONLY consecutive valid non-suspect points of SAME detector) */}
+  src\components\ExplorerPage.tsx:1026:                  {connectingSegments.map((seg, idx) => (
+  src\components\ExplorerPage.tsx:1027:                    <path
+  src\components\ExplorerPage.tsx:1028:                      key={`seg-${idx}`}
+  src\components\ExplorerPage.tsx:1029:                      d={seg.d}
+  src\components\ExplorerPage.tsx:1030:                      fill="none"
+  src\components\ExplorerPage.tsx:1031:                      stroke={seg.color}
+  src\components\ExplorerPage.tsx:1032:                      strokeWidth={1.2}
+  src\components\ExplorerPage.tsx:1033:                      strokeOpacity={0.75}
+  src\components\ExplorerPage.tsx:1091:                          opacity={isSuspect ? 0.4 : 0.7}
+  src\components\ExplorerPage.tsx:1092:                        />
+> src\components\ExplorerPage.tsx:1093:                        {/* Point Marker: Suspect points drawn hollow */}
+  src\components\ExplorerPage.tsx:1094:                        {isSuspect ? (
+  src\components\ExplorerPage.tsx:1095:                          <circle
+  src\components\ExplorerPage.tsx:1096:                            cx={x}
+  src\components\ExplorerPage.tsx:1097:                            cy={y}
+  src\components\ExplorerPage.tsx:1098:                            r={isSelected ? 4.5 : 3.2}
+  src\components\ExplorerPage.tsx:1099:                            fill="none"
+  src\components\ExplorerPage.tsx:1100:                            stroke={isSelected ? '#ffffff' : color}
+  src\components\ExplorerPage.tsx:1101:                            strokeWidth={1.8}
+  src\components\ExplorerPage.tsx:1146:                      className="rounded accent-amber-400 cursor-pointer"
+  src\components\ExplorerPage.tsx:1147:                    />
+> src\components\ExplorerPage.tsx:1148:                    <span>Show suspect points</span>
+  src\components\ExplorerPage.tsx:1149:                  </label>
+  src\components\ExplorerPage.tsx:1150:                </div>
+  src\components\ExplorerPage.tsx:1151:              </div>
+  src\components\ExplorerPage.tsx:1152:
+  src\components\ExplorerPage.tsx:1153:              {/* Photometry Table for Hovered / Selected Point */}
+  src\components\ExplorerPage.tsx:1154:              {(() => {
+  src\components\ExplorerPage.tsx:1155:                const pt =
+  src\components\ExplorerPage.tsx:1156:                  hoveredPoint ||
+  src\components\HomePage.tsx:364:
+  src\components\HomePage.tsx:365:            <div className="p-3 rounded-xl bg-surface-container-lowest border border-surface-container-high flex 
+flex-col">
+> src\components\HomePage.tsx:366:              <span className="text-outline text-[10px]">VALID SPECTRAL POINTS:</span>
+  src\components\HomePage.tsx:367:              <span className="text-lg font-bold text-primary mt-0.5">{stats.validPoints.toLocaleString()}</span>
+  src\components\HomePage.tsx:368:              <span className="text-outline text-[10px]">Nulls preserved with reasons</span>
+  src\components\HomePage.tsx:369:            </div>
+  src\components\HomePage.tsx:370:
+  src\components\HomePage.tsx:371:            <div className="p-3 rounded-xl bg-surface-container-lowest border border-surface-container-high flex 
+flex-col">
+  src\components\HomePage.tsx:372:              <span className="text-outline text-[10px]">WAVELENGTH RANGE:</span>
+  src\components\HomePage.tsx:373:              <span className="text-lg font-bold text-on-surface mt-0.5">{stats.waveMin} – {stats.waveMax} µm</span>
+  src\components\HomePage.tsx:374:              <span className="text-outline text-[10px]">{stats.exposures} separate exposures</span>
+  src\components\MethodPage.tsx:51:      designRange: '2.42 – 3.82 µm',
+  src\components\MethodPage.tsx:52:      designR: '~35',
+> src\components\MethodPage.tsx:53:      focus: 'Mid-infrared continuum (holds reference detection exposure E076 at 3.049 µm)',
+  src\components\MethodPage.tsx:54:    },
+  src\components\MethodPage.tsx:55:    {
+  src\components\MethodPage.tsx:56:      id: 'LVF 5',
+  src\components\MethodPage.tsx:57:      detNum: 5,
+  src\components\MethodPage.tsx:58:      designRange: '3.82 – 4.42 µm',
+  src\components\MethodPage.tsx:59:      designR: '~110',
+  src\components\MethodPage.tsx:60:      focus: 'High spectral resolution infrared continuum and ice absorption tracers',
+  src\components\MethodPage.tsx:61:    },
+  src\components\MethodPage.tsx:183:              <div className="flex items-center justify-between border-b border-surface-container-high/50 pb-2">
+  src\components\MethodPage.tsx:184:                <span className="font-bold text-primary font-headline-sm text-sm">
+> src\components\MethodPage.tsx:185:                  6. Rigorous Null Accounting
+  src\components\MethodPage.tsx:186:                </span>
+  src\components\MethodPage.tsx:187:                <span className="font-data-mono-sm text-[11px] text-secondary">
+  src\components\MethodPage.tsx:188:                  Never zero / interpolated
+  src\components\MethodPage.tsx:189:                </span>
+  src\components\MethodPage.tsx:190:              </div>
+  src\components\MethodPage.tsx:191:              <p className="text-on-surface-variant leading-relaxed font-light">
+  src\components\MethodPage.tsx:192:                Corrupted, flagged, or clipped data points are stored as null (None) and never interpolated or 
+zeroed. Every null carries a verified reason: "outside image", "too few good pixels", or "too few background pixels".
+  src\components\MethodPage.tsx:193:              </p>
+  src\components\MethodPage.tsx:226:
+  src\components\MethodPage.tsx:227:            <div className="p-3 rounded bg-surface-container-low border border-surface-container-high flex flex-col 
+gap-1">
+> src\components\MethodPage.tsx:228:              <span className="font-semibold text-on-surface">4. Suspect Points</span>
+  src\components\MethodPage.tsx:229:              <p className="font-light">
+> src\components\MethodPage.tsx:230:                Suspect points: some measurements may be affected by flagged pixels or image edges. They are marked, 
+not removed.
+  src\components\MethodPage.tsx:231:              </p>
+  src\components\MethodPage.tsx:232:            </div>
+  src\components\MethodPage.tsx:233:          </div>
+  src\components\MethodPage.tsx:234:        </div>
+  src\components\MethodPage.tsx:235:
+  src\components\MethodPage.tsx:236:        {/* 6 Linear Variable Filter Arrays Directory Table */}
+  src\components\MethodPage.tsx:237:        <div className="p-5 rounded-xl bg-surface-container-lowest border border-surface-container-high shadow-lg 
+flex flex-col gap-4">
+  src\components\MethodPage.tsx:238:          <div className="flex flex-col gap-1 border-b border-surface-container-high/60 pb-3">
+  src\components\MethodPage.tsx:253:                  <th className="py-2.5 px-3">Resolution (R)</th>
+  src\components\MethodPage.tsx:254:                  <th className="py-2.5 px-3">Measured in Dataset (exposures.json)</th>
+> src\components\MethodPage.tsx:255:                  <th className="py-2.5 px-3">Scientific Role</th>
+  src\components\MethodPage.tsx:256:                </tr>
+  src\components\MethodPage.tsx:257:              </thead>
+  src\components\MethodPage.tsx:258:              <tbody>
+  src\components\MethodPage.tsx:259:                {detectorData.map((det) => {
+  src\components\MethodPage.tsx:260:                  const detExposures = exposures.filter((e) => e.detector === det.detNum);
+  src\components\MethodPage.tsx:261:                  const expCount = detExposures.length || 20;
+  src\components\MethodPage.tsx:262:                  const minW = detExposures.length
+  src\components\MethodPage.tsx:263:                    ? Math.min(...detExposures.map((e) => e.wavelength_min_um ?? e.wavelength_um))
+  src\components\MovingObjectsPage.tsx:79:          <div className="w-full mt-4 p-5 rounded-xl bg-surface-container-low border 
+border-surface-container-high/80 text-left flex flex-col gap-3">
+  src\components\MovingObjectsPage.tsx:80:            <span className="text-xs font-data-mono-sm uppercase tracking-wider text-secondary font-semibold">
+> src\components\MovingObjectsPage.tsx:81:              Screening Requirements & Physics Criteria
+  src\components\MovingObjectsPage.tsx:82:            </span>
+  src\components\MovingObjectsPage.tsx:83:            <ul className="text-xs text-on-surface-variant font-data-mono-sm space-y-2 list-disc list-inside">
+  src\components\MovingObjectsPage.tsx:84:              <li>
+> src\components\MovingObjectsPage.tsx:85:                <span className="text-on-surface font-medium">Temporal baseline:</span> A separation of ≥ 14 
+days is necessary so apparent angular displacement exceeds the instrument point-spread function (6.15 arcsec pixel scale).
+  src\components\MovingObjectsPage.tsx:86:              </li>
+  src\components\MovingObjectsPage.tsx:87:              <li>
+> src\components\MovingObjectsPage.tsx:88:                <span className="text-on-surface font-medium">Detector pairing:</span> Candidate pairs must 
+share the same Linear Variable Filter detector band to distinguish true orbital motion from wavelength-dependent spatial gradients.
+  src\components\MovingObjectsPage.tsx:89:              </li>
+  src\components\MovingObjectsPage.tsx:90:              <li>
+> src\components\MovingObjectsPage.tsx:91:                <span className="text-on-surface font-medium">Current coverage:</span> The NEP Deep Field 
+exposures in Quick Release 2 cover an observing window of approximately 3 days, providing single-epoch snapshots without the revisit baseline required 
+for moving-body screening.
+  src\components\MovingObjectsPage.tsx:92:              </li>
+  src\components\MovingObjectsPage.tsx:93:            </ul>
+  src\components\MovingObjectsPage.tsx:94:          </div>
+  src\components\MovingObjectsPage.tsx:95:        </div>
+  src\components\MovingObjectsPage.tsx:96:      </div>
+  src\components\MovingObjectsPage.tsx:97:    </div>
+  src\components\MovingObjectsPage.tsx:98:  );
+  src\components\MovingObjectsPage.tsx:99:};
+
+
