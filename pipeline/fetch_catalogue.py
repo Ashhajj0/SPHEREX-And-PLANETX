@@ -40,6 +40,7 @@ CONFIG_FILE = REPO_ROOT / "pipeline" / "regions.yaml"
 
 ESA_GAIA_TAP_URL = "https://gea.esac.esa.int/tap-server/tap/sync"
 IRSA_TAP_URL = "https://irsa.ipac.caltech.edu/TAP/sync"
+VIZIER_TAP_URL = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +75,13 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         return data
 
 
+import time
+
 # ---------------------------------------------------------------------------
 # Execute TAP ADQL Query
 # ---------------------------------------------------------------------------
-def execute_tap_query(service_url: str, adql_query: str, timeout: int = 45) -> str:
-    """Executes a synchronous TAP query and returns the raw CSV response."""
+def execute_tap_query(service_url: str, adql_query: str, timeout: int = 90, max_retries: int = 3) -> str:
+    """Executes a synchronous TAP query with retries and returns the raw CSV response."""
     params = {
         "REQUEST": "doQuery",
         "LANG": "ADQL",
@@ -86,17 +89,21 @@ def execute_tap_query(service_url: str, adql_query: str, timeout: int = 45) -> s
         "QUERY": adql_query
     }
     data = urllib.parse.urlencode(params).encode("utf-8")
-    req = urllib.request.Request(
-        service_url,
-        data=data,
-        headers={"User-Agent": "SPHEREx-Catalogue-Fetcher/2.0"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8")
-    except Exception as e:
-        print(f"[FATAL] TAP query to {service_url} failed: {e}")
-        sys.exit(1)
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(
+            service_url,
+            data=data,
+            headers={"User-Agent": "SPHEREx-Catalogue-Fetcher/2.0"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8")
+        except Exception as e:
+            last_err = e
+            print(f"    [Retry {attempt}/{max_retries}] TAP query warning: {e}")
+            time.sleep(2.0 * attempt)
+    raise RuntimeError(f"TAP query to {service_url} failed after {max_retries} attempts: {last_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +142,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fetch reference star catalogues (Gaia DR3 / AllWISE) for target regions."
     )
+    parser.add_argument(
+        "--region",
+        type=str,
+        default="all",
+        help="Region ID to download (or 'all' for all regions in pipeline/regions.yaml)."
+    )
     args = parser.parse_args()
 
     print("=================================================================")
@@ -144,7 +157,18 @@ def main():
 
     offline_mode = os.environ.get("OFFLINE", "0").lower() in ("1", "true", "yes")
     config = load_config(CONFIG_FILE)
-    regions = config.get("regions", [])
+    all_regions = config.get("regions", [])
+
+    if args.region.lower() != "all":
+        requested = {r.strip() for r in args.region.split(",") if r.strip()}
+        regions = [r for r in all_regions if r.get("id") in requested]
+        if not regions:
+            valid_ids = [r.get("id") for r in all_regions]
+            print(f"[FATAL] Region(s) {sorted(requested)} not found in pipeline/regions.yaml.")
+            print(f"Available region IDs: {', '.join(valid_ids)}")
+            sys.exit(1)
+    else:
+        regions = all_regions
 
     if offline_mode:
         print("[OFFLINE MODE ACTIVE] OFFLINE=1 is set. Checking local cache only.\n")
@@ -168,6 +192,9 @@ def main():
         print("\n[PASS] Offline catalogue check complete.")
         sys.exit(0)
 
+    succeeded: List[str] = []
+    failed: List[str] = []
+
     # Online mode: query real services
     for reg in regions:
         reg_id = reg["id"]
@@ -185,55 +212,92 @@ def main():
         print(f"[{reg_id}] Target Catalogue: {cat_type.upper()}")
         print(f"  Field Center: RA={ra:.4f}°, Dec={dec:.4f}°, Radius={radius_deg*60:.1f} arcmin (includes 2' margin)")
 
-        if cat_type == "gaia_dr3":
-            service_url = ESA_GAIA_TAP_URL
-            table_name = "gaiadr3.gaia_source"
-            adql_query = f"""
-            SELECT
-                source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
-                pmra, pmdec, parallax
-            FROM {table_name}
-            WHERE 1 = CONTAINS(
-                POINT('ICRS', ra, dec),
-                CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f})
-            )
-            ORDER BY phot_g_mean_mag ASC
-            """.strip()
+        try:
+            if cat_type == "gaia_dr3":
+                service_url = ESA_GAIA_TAP_URL
+                table_name = "gaiadr3.gaia_source"
+                # If the region lists specific Gaia DR3 source IDs (e.g. bright nearby targets),
+                # include them explicitly alongside the cone search so they are always present.
+                raw_ids = str(reg.get("gaia_source_ids", "")).strip()
+                explicit_ids = [s.strip() for s in raw_ids.split(",") if s.strip().isdigit()]
+                where_clause = (
+                    f"1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f}))"
+                )
+                if explicit_ids:
+                    where_clause = f"({where_clause} OR source_id IN ({', '.join(explicit_ids)}))"
+                adql_query = f"""
+                SELECT
+                    source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
+                    pmra, pmdec, parallax
+                FROM {table_name}
+                WHERE {where_clause}
+                ORDER BY phot_g_mean_mag ASC
+                """.strip()
 
-        elif cat_type == "allwise":
-            service_url = IRSA_TAP_URL
-            table_name = "allwise_p3as_psd"
-            cols = get_verified_allwise_columns()
-            col_list_str = ", ".join(cols)
-            adql_query = f"""
-            SELECT
-                {col_list_str}
-            FROM {table_name}
-            WHERE 1 = CONTAINS(
-                POINT('ICRS', ra, dec),
-                CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f})
-            )
-            ORDER BY w1mpro ASC
-            """.strip()
-        else:
-            print(f"[FATAL] Unknown catalogue type '{cat_type}' requested for region {reg_id}.")
-            sys.exit(1)
+            elif cat_type == "allwise":
+                try:
+                    service_url = IRSA_TAP_URL
+                    table_name = "allwise_p3as_psd"
+                    cols = get_verified_allwise_columns()
+                    col_list_str = ", ".join(cols)
+                    adql_query = f"""
+                    SELECT
+                        {col_list_str}
+                    FROM {table_name}
+                    WHERE 1 = CONTAINS(
+                        POINT('ICRS', ra, dec),
+                        CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f})
+                    )
+                    ORDER BY w1mpro ASC
+                    """.strip()
+                    print(f"  Executing ADQL query against {service_url}...")
+                    raw_csv = execute_tap_query(service_url, adql_query, timeout=90)
+                except Exception as irsa_err:
+                    print(f"  [IRSA fallback] IRSA TAP unavailable ({irsa_err}); querying CDS VizieR II/328/allwise...")
+                    service_url = VIZIER_TAP_URL
+                    table_name = "II/328/allwise"
+                    adql_query = f"""
+                    SELECT
+                        AllWISE AS designation,
+                        RAJ2000 AS ra,
+                        DEJ2000 AS dec,
+                        W1mag AS w1mpro,
+                        W2mag AS w2mpro
+                    FROM "II/328/allwise"
+                    WHERE 1 = CONTAINS(
+                        POINT('ICRS', RAJ2000, DEJ2000),
+                        CIRCLE('ICRS', {ra:.6f}, {dec:.6f}, {radius_deg:.6f})
+                    )
+                    ORDER BY W1mag ASC
+                    """.strip()
+                    raw_csv = execute_tap_query(service_url, adql_query, timeout=90)
+            else:
+                print(f"  [ERROR] Unknown catalogue type '{cat_type}' requested for region {reg_id}.")
+                failed.append(reg_id)
+                continue
 
-        print(f"  Executing ADQL query against {service_url}...")
-        raw_csv = execute_tap_query(service_url, adql_query, timeout=45)
+            if cat_type != "allwise":
+                print(f"  Executing ADQL query against {service_url}...")
+                raw_csv = execute_tap_query(service_url, adql_query, timeout=90)
+        except Exception as e:
+            print(f"  [ERROR] Catalogue query failed for [{reg_id}]: {e}")
+            print("  Skipping this region and continuing...\n")
+            failed.append(reg_id)
+            continue
 
         # Parse CSV to count valid rows
         lines = [line.strip() for line in raw_csv.splitlines() if line.strip()]
         if len(lines) <= 1:
-            print(f"[FATAL] Service returned 0 sources for region '{reg_id}'.")
-            print("Zero sources found. No fake data will be created.")
-            sys.exit(1)
+            print(f"  [WARNING] Service returned 0 sources for region '{reg_id}'. Skipping...\n")
+            failed.append(reg_id)
+            continue
 
         # Check for error responses formatted inside table
         header_line = lines[0]
         if "error" in header_line.lower() or "exception" in header_line.lower():
-            print(f"[FATAL] TAP query returned an error response:\n{raw_csv[:300]}")
-            sys.exit(1)
+            print(f"  [ERROR] TAP query returned an error response for [{reg_id}]:\n{raw_csv[:300]}\n")
+            failed.append(reg_id)
+            continue
 
         source_count = len(lines) - 1
         print(f"  Successfully retrieved {source_count} real sources from {table_name}.")
@@ -252,8 +316,16 @@ def main():
                 f.write(f"{line}\n")
 
         print(f"  -> Saved to: {dest_file.relative_to(REPO_ROOT)} ({source_count} sources)\n")
+        succeeded.append(reg_id)
 
-    print("[SUCCESS] Star catalogue downloads completed successfully.")
+    if not succeeded:
+        print(f"[FATAL] Catalogue downloads failed for all requested regions: {failed}")
+        sys.exit(1)
+
+    if failed:
+        print(f"[WARNING] Some regions failed (re-run with --region {','.join(failed)}): {', '.join(failed)}")
+
+    print(f"[SUCCESS] Star catalogue downloads completed for {len(succeeded)} region(s).")
 
 
 if __name__ == "__main__":

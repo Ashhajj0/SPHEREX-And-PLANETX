@@ -181,8 +181,18 @@ def detect_sources(
         # Sort indices by SNR descending
         sort_order = np.argsort(-snrs)
 
-        # Region short prefix (e.g. NEP, SEP, COSMOS)
-        prefix = region_id.upper().replace("NORTH-ECLIPTIC-POLE", "NEP").replace("SOUTH-ECLIPTIC-POLE", "SEP")
+        # Region short prefix (e.g. NEP, SEP, COSMOS, BARNARD, EPSIND, WISE0855, RWAUR, RDRA)
+        region_prefixes = {
+            "north-ecliptic-pole": "NEP",
+            "south-ecliptic-pole": "SEP",
+            "cosmos": "COSMOS",
+            "barnards-star": "BARNARD",
+            "epsilon-indi": "EPSIND",
+            "wise-0855-0714": "WISE0855",
+            "rw-aurigae": "RWAUR",
+            "r-draconis": "RDRA",
+        }
+        prefix = region_prefixes.get(region_id.lower(), region_id.upper())
         if not prefix.startswith("SPX"):
             prefix = f"SPX-{prefix}"
 

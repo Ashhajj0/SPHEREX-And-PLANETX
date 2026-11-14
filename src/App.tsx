@@ -18,13 +18,16 @@ import {
   FilterPopover,
 } from './components/Modals.tsx';
 import {
+  CONFIGURED_SKY_REGIONS,
   SPHEREX_TARGETS,
   SPHEREX_BANDS,
   TargetObject,
   SpectralBand,
 } from './data/spherexData.ts';
 import {
+  loadAvailableRegions,
   loadRealData,
+  ExportedRegionSummary,
   RealDataset,
   RealExposure,
   RealSource,
@@ -35,6 +38,8 @@ export default function App() {
 
   // Real data state
   const [dataSource, setDataSource] = useState<'real' | 'fixture'>('fixture');
+  const [availableRegions, setAvailableRegions] = useState<ExportedRegionSummary[]>([]);
+  const [activeRegionId, setActiveRegionId] = useState<string>('');
   const [realDataset, setRealDataset] = useState<RealDataset | null>(null);
   const [missingDetails, setMissingDetails] = useState<{
     files: string[];
@@ -74,39 +79,48 @@ export default function App() {
   const [isPinpointOpen, setIsPinpointOpen] = useState(false);
   const [isFilterOpen, setIsFilterOpen] = useState(false);
 
-  // Load real data on mount
+  const applyLoadedDataset = (dataset: RealDataset) => {
+    setDataSource('real');
+    setRealDataset(dataset);
+    setActiveRegionId(dataset.manifest.region.id);
+    setMissingDetails(null);
+    setShowErrorBanner(false);
+
+    // Select brightest source automatically on load
+    const sortedSources = [...dataset.sources].sort((a, b) => b.peak_snr - a.peak_snr);
+    const brightest = sortedSources[0] || null;
+    setSelectedRealSource(brightest);
+
+    // Select reference exposure or first exposure
+    const refId = dataset.manifest.detection?.reference_exposure_id;
+    const refExp = dataset.exposures.find((e) => e.id === refId) || dataset.exposures[0] || null;
+    setSelectedRealExposure(refExp);
+
+    setCursorStatus((prev) => ({
+      ...prev,
+      dataSource: 'real',
+      exposure_id: refExp?.id || null,
+      wavelength_um: refExp?.wavelength_um || null,
+      detector: refExp?.detector || null,
+      selectedSourceId: brightest?.id || null,
+      regionName: dataset.manifest.region.name,
+    }));
+  };
+
+  // Load region index & default real data on mount
   useEffect(() => {
     let isMounted = true;
+
+    loadAvailableRegions().then((regions) => {
+      if (!isMounted) return;
+      setAvailableRegions(regions);
+    });
 
     loadRealData()
       .then((res) => {
         if (!isMounted) return;
         if (res.success && res.data) {
-          const dataset = res.data;
-          setDataSource('real');
-          setRealDataset(dataset);
-          setMissingDetails(null);
-          setShowErrorBanner(false);
-
-          // Select brightest source automatically on first load
-          const sortedSources = [...dataset.sources].sort((a, b) => b.peak_snr - a.peak_snr);
-          const brightest = sortedSources[0] || null;
-          setSelectedRealSource(brightest);
-
-          // Select reference exposure or first exposure
-          const refId = dataset.manifest.detection.reference_exposure_id;
-          const refExp = dataset.exposures.find((e) => e.id === refId) || dataset.exposures[0] || null;
-          setSelectedRealExposure(refExp);
-
-          setCursorStatus((prev) => ({
-            ...prev,
-            dataSource: 'real',
-            exposure_id: refExp?.id || null,
-            wavelength_um: refExp?.wavelength_um || null,
-            detector: refExp?.detector || null,
-            selectedSourceId: brightest?.id || null,
-            regionName: dataset.manifest.region.name,
-          }));
+          applyLoadedDataset(res.data);
         } else {
           setDataSource('fixture');
           const details = {
@@ -115,18 +129,19 @@ export default function App() {
             error: res.errorMessage,
           };
           setMissingDetails(details);
-          // Show small error notice if any files were expected
           if (res.missingFiles.length > 0 || res.missingKeys.length > 0) {
             setShowErrorBanner(true);
           }
           setCursorStatus((prev) => ({
             ...prev,
             dataSource: 'fixture',
-            exposure_id: 'B038',
-            wavelength_um: 2.42,
-            detector: 4,
+            ra_deg: SPHEREX_TARGETS[0].raDeg,
+            dec_deg: SPHEREX_TARGETS[0].decDeg,
+            exposure_id: `B${String(currentBand.bandNumber).padStart(3, '0')}`,
+            wavelength_um: currentBand.wavelength,
+            detector: Number(currentBand.detector.replace(/\D/g, '')) || 4,
             selectedSourceId: SPHEREX_TARGETS[0].id,
-            regionName: 'Synthetic Demo Field',
+            regionName: SPHEREX_TARGETS[0].field || 'Synthetic Demo Field',
           }));
         }
       })
@@ -143,12 +158,77 @@ export default function App() {
     };
   }, []);
 
+  const handleSelectFixtureRegion = (regionId: string, navigateToExplorer = true) => {
+    const cfg = CONFIGURED_SKY_REGIONS.find((r) => r.id === regionId);
+    const matchedTarget =
+      SPHEREX_TARGETS.find((t) => t.id === cfg?.targetId || t.id === regionId) ||
+      SPHEREX_TARGETS[0];
+
+    setCurrentTarget(matchedTarget);
+    setActiveRegionId(regionId);
+    if (!realDataset) {
+      setDataSource('fixture');
+      setCursorStatus((prev) => ({
+        ...prev,
+        dataSource: 'fixture',
+        ra_deg: matchedTarget.raDeg,
+        dec_deg: matchedTarget.decDeg,
+        exposure_id: `B${String(currentBand.bandNumber).padStart(3, '0')}`,
+        wavelength_um: currentBand.wavelength,
+        detector: Number(currentBand.detector.replace(/\D/g, '')) || 4,
+        selectedSourceId: matchedTarget.id,
+        regionName: cfg?.name || matchedTarget.field || matchedTarget.name,
+      }));
+    }
+    if (navigateToExplorer) {
+      setActiveTab('explorer');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  const handleSelectRegion = async (regionId: string, navigateToExplorer = false) => {
+    const isExported = availableRegions.some((r) => r.id === regionId);
+    if (!isExported) {
+      handleSelectFixtureRegion(regionId, navigateToExplorer);
+      return;
+    }
+    const res = await loadRealData(regionId);
+    if (res.success && res.data) {
+      applyLoadedDataset(res.data);
+      if (navigateToExplorer) {
+        setActiveTab('explorer');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    } else {
+      handleSelectFixtureRegion(regionId, navigateToExplorer);
+    }
+  };
+
   const handleSelectTarget = (target: TargetObject) => {
     setCurrentTarget(target);
+    if (!realDataset) {
+      setCursorStatus((prev) => ({
+        ...prev,
+        dataSource: 'fixture',
+        ra_deg: target.raDeg,
+        dec_deg: target.decDeg,
+        selectedSourceId: target.id,
+        regionName: target.field || target.name,
+      }));
+    }
   };
 
   const handleSelectBand = (band: SpectralBand) => {
     setCurrentBand(band);
+    if (!realDataset) {
+      const detNum = Number(band.detector.replace(/\D/g, '')) || 1;
+      setCursorStatus((prev) => ({
+        ...prev,
+        exposure_id: `B${String(band.bandNumber).padStart(3, '0')}`,
+        wavelength_um: band.wavelength,
+        detector: detNum,
+      }));
+    }
   };
 
   const handleSelectRealSource = (src: RealSource) => {
@@ -239,7 +319,7 @@ export default function App() {
           </div>
           <p className="font-body-sm text-xs text-on-surface-variant font-light">
             Real SPHEREx QR2 files not found in <code className="text-secondary">web/public/real/</code>.
-            Run <code className="text-primary">python -m backend.compute.export_region north-ecliptic-pole</code> to generate them.
+            Run <code className="text-primary">python -m backend.compute.export_region --all</code> to generate them.
           </p>
           {missingDetails.keys.length > 0 && (
             <div className="text-[10px] text-outline">
@@ -255,6 +335,10 @@ export default function App() {
           <HomePage
             dataSource={dataSource}
             realDataset={realDataset}
+            availableRegions={availableRegions}
+            activeRegionId={activeRegionId}
+            onSelectRegion={(rid) => handleSelectRegion(rid, true)}
+            onSelectFixtureRegion={(rid) => handleSelectFixtureRegion(rid, true)}
             missingDetails={missingDetails}
             onEnterExplorer={handleEnterExplorer}
             onNavigateTab={(tab) => {
@@ -272,6 +356,10 @@ export default function App() {
           <ExplorerPage
             dataSource={dataSource}
             realDataset={realDataset}
+            availableRegions={availableRegions}
+            activeRegionId={activeRegionId}
+            onSelectRegion={(rid) => handleSelectRegion(rid, false)}
+            onSelectFixtureRegion={(rid) => handleSelectFixtureRegion(rid, false)}
             missingDetails={missingDetails}
             selectedRealExposure={selectedRealExposure}
             onSelectRealExposure={handleSelectRealExposure}

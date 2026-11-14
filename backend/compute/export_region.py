@@ -246,50 +246,177 @@ def render_display_png(
 
 
 # ---------------------------------------------------------------------------
-# Region Config Loader
+# Region Config Loader & Epoch Pair Finder
 # ---------------------------------------------------------------------------
-def get_region_metadata(region_id: str) -> Dict[str, Any]:
-    """Reads region coordinates and name from pipeline/regions.yaml."""
+def load_regions_config() -> List[Dict[str, Any]]:
+    """Loads all region definitions from pipeline/regions.yaml (with pure-Python fallback)."""
     if not REGIONS_CONFIG.exists():
-        return {
-            "id": region_id,
-            "name": region_id.replace("-", " ").title(),
-            "ra_deg": 270.3317 if "north" in region_id else (90.0 if "south" in region_id else 150.1192),
-            "dec_deg": 66.5614 if "north" in region_id else (-66.5614 if "south" in region_id else 2.2058),
-            "size_arcmin": 15.0
-        }
+        return []
 
     try:
         import yaml
         with open(REGIONS_CONFIG, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
-            for r in cfg.get("regions", []):
-                if r.get("id") == region_id:
-                    return r
+            return list(cfg.get("regions", []))
     except Exception:
-        pass
+        regions: List[Dict[str, Any]] = []
+        current_reg: Optional[Dict[str, Any]] = None
+        with open(REGIONS_CONFIG, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("- id:"):
+                    current_reg = {"id": s.split(":", 1)[1].strip().strip('"\'')}
+                    regions.append(current_reg)
+                elif current_reg is not None and ":" in s and not s.startswith("#"):
+                    k, v = s.split(":", 1)
+                    k, v = k.strip(), v.strip().strip('"\'')
+                    try:
+                        current_reg[k] = float(v) if "." in v else int(v)
+                    except ValueError:
+                        current_reg[k] = v
+        return regions
+
+
+def get_region_metadata(region_id: str) -> Dict[str, Any]:
+    """Reads region coordinates and metadata from pipeline/regions.yaml."""
+    for r in load_regions_config():
+        if r.get("id") == region_id:
+            return r
 
     return {
         "id": region_id,
         "name": region_id.replace("-", " ").title(),
-        "ra_deg": 270.3317,
-        "dec_deg": 66.5614,
+        "ra_deg": 270.3317 if "north" in region_id else (90.0 if "south" in region_id else 150.1192),
+        "dec_deg": 66.5614 if "north" in region_id else (-66.5614 if "south" in region_id else 2.2058),
         "size_arcmin": 15.0
     }
+
+
+def compute_epoch_pairs_from_exposures(exposures_export: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Finds exposure pairs on the same detector with central wavelength within 2%
+    and observation separation >= 14.0 days.
+    """
+    def parse_iso(ts: str) -> Optional[datetime]:
+        if not ts:
+            return None
+        clean = str(ts).strip().split("+")[0].rstrip("Z")
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(clean, fmt)
+            except ValueError:
+                continue
+        return None
+
+    pairs: List[Dict[str, Any]] = []
+    n = len(exposures_export)
+    for i in range(n):
+        e1 = exposures_export[i]
+        d1 = parse_iso(e1.get("time_utc", ""))
+        w1 = e1.get("wavelength_um")
+        det1 = e1.get("detector")
+        if d1 is None or det1 is None:
+            continue
+
+        for j in range(i + 1, n):
+            e2 = exposures_export[j]
+            d2 = parse_iso(e2.get("time_utc", ""))
+            w2 = e2.get("wavelength_um")
+            det2 = e2.get("detector")
+            if d2 is None or det2 is None or det1 != det2:
+                continue
+
+            delta_days = abs((d2 - d1).total_seconds()) / 86400.0
+            if delta_days < 14.0:
+                continue
+
+            if w1 and w2 and w1 > 0:
+                diff_pct = abs(w1 - w2) / w1 * 100.0
+                if diff_pct > 2.0:
+                    continue
+            else:
+                diff_pct = 0.0
+
+            first, second = (e1, e2) if d1 <= d2 else (e2, e1)
+            pairs.append({
+                "detector": det1,
+                "epoch_1": {
+                    "id": first.get("id"),
+                    "file": first.get("file"),
+                    "time_utc": first.get("time_utc"),
+                    "wavelength_um": first.get("wavelength_um"),
+                },
+                "epoch_2": {
+                    "id": second.get("id"),
+                    "file": second.get("file"),
+                    "time_utc": second.get("time_utc"),
+                    "wavelength_um": second.get("wavelength_um"),
+                },
+                "separation_days": round(delta_days, 1),
+                "wavelength_diff_pct": round(diff_pct, 2),
+            })
+
+    return pairs
+
+
+def update_regions_index() -> None:
+    """Scans web/public/real/regions/*/manifest.json and writes web/public/real/regions.json."""
+    regions_dir = WEB_EXPORT_DIR / "regions"
+    index_items: List[Dict[str, Any]] = []
+    if regions_dir.exists():
+        # Order according to pipeline/regions.yaml first, then any extra exported directories
+        configured_order = [r.get("id") for r in load_regions_config() if r.get("id")]
+        found_dirs = {d.name: d for d in regions_dir.iterdir() if d.is_dir() and (d / "manifest.json").exists()}
+        ordered_ids = [rid for rid in configured_order if rid in found_dirs] + sorted(
+            rid for rid in found_dirs if rid not in configured_order
+        )
+        for rid in ordered_ids:
+            try:
+                with open(found_dirs[rid] / "manifest.json", "r", encoding="utf-8") as mf:
+                    m = json.load(mf)
+                index_items.append({
+                    "id": m.get("region", {}).get("id", rid),
+                    "name": m.get("region", {}).get("name", rid),
+                    "ra_deg": m.get("region", {}).get("ra_deg"),
+                    "dec_deg": m.get("region", {}).get("dec_deg"),
+                    "size_arcmin": m.get("region", {}).get("size_arcmin"),
+                    "target_identifiers": m.get("region", {}).get("target_identifiers"),
+                    "description": m.get("region", {}).get("description"),
+                    "catalogue": m.get("catalogue", {}),
+                    "counts": m.get("counts", {}),
+                    "path": f"regions/{rid}",
+                })
+            except Exception:
+                continue
+
+    clean_index = sanitize_json({"regions": index_items, "generated_utc": datetime.now(timezone.utc).isoformat()})
+    WEB_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(WEB_EXPORT_DIR / "regions.json", "w", encoding="utf-8") as f:
+        json.dump(clean_index, f, indent=2, allow_nan=False)
+    if ROOT_EXPORT_DIR.parent.exists():
+        ROOT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        with open(ROOT_EXPORT_DIR / "regions.json", "w", encoding="utf-8") as f:
+            json.dump(clean_index, f, indent=2, allow_nan=False)
 
 
 # ---------------------------------------------------------------------------
 # Main Export Routine
 # ---------------------------------------------------------------------------
-def export_region_data(region_id: str = "north-ecliptic-pole"):
+def export_region_data(region_id: str = "north-ecliptic-pole", write_root: bool = True):
     """
     Loads all real exposures, detects sources, measures spectra, aligns images,
-    and exports clean JSON files and PNGs to web/public/real/.
+    and exports clean JSON files and PNGs to:
+      - web/public/real/regions/<region_id>/ (always)
+      - web/public/real/ (when write_root=True, for backwards compatibility)
+    Also mirrors to public/real/.
     """
+    region_export_web = WEB_EXPORT_DIR / "regions" / region_id
+    region_export_root = ROOT_EXPORT_DIR / "regions" / region_id
+
     print("=================================================================")
-    print(" SPHEREx Scientific Results Exporter (Phase 3A)")
+    print(" SPHEREx Scientific Results Exporter")
     print(f" Target Region: {region_id}")
-    print(f" Target Folder: {WEB_EXPORT_DIR.relative_to(REPO_ROOT)}")
+    print(f" Target Folder: {region_export_web.relative_to(REPO_ROOT)}")
     print("=================================================================\n")
 
     region_spherex_dir = CACHE_SPHEREX / region_id
@@ -303,15 +430,19 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
         print("Please run 'python pipeline/fetch_spherex.py' first.")
         sys.exit(1)
 
-    # Ensure export directories exist
-    WEB_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    images_dir = WEB_EXPORT_DIR / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
+    target_dirs = [region_export_web]
+    if ROOT_EXPORT_DIR.parent.exists():
+        target_dirs.append(region_export_root)
+    if write_root:
+        target_dirs.append(WEB_EXPORT_DIR)
+        if ROOT_EXPORT_DIR.parent.exists():
+            target_dirs.append(ROOT_EXPORT_DIR)
 
-    # Add required README.txt
-    readme_path = WEB_EXPORT_DIR / "README.txt"
-    with open(readme_path, "w", encoding="utf-8") as f:
-        f.write("Generated from real SPHEREx QR2 files by export_region.py. Do not edit by hand.\n")
+    for d in target_dirs:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "images").mkdir(parents=True, exist_ok=True)
+        with open(d / "README.txt", "w", encoding="utf-8") as f:
+            f.write("Generated from real SPHEREx QR2 files by export_region.py. Do not edit by hand.\n")
 
     # 1. Load real cutouts into memory
     print(f"[1/6] Loading real SPHEREx cutouts from cache/spherex/{region_id}...")
@@ -327,32 +458,42 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
     sources, det_meta = detect_sources(ref_exp, threshold_sigma=5.0, region_id=region_id)
     print(f"      Detected {len(sources)} sources at 5-sigma threshold on reference exposure {ref_exp.file_name}.")
 
-    # 3. Crossmatch with Gaia DR3 reference catalogue
+    # 3. Crossmatch with Gaia DR3 or AllWISE reference catalogue
     print(f"[3/6] Cross-matching against reference star catalogue...")
     cat_files = list(region_cat_dir.glob("*.csv")) if region_cat_dir.exists() else []
     cat_files = [f for f in cat_files if not f.name.startswith("fixture_")]
 
+    region_info = get_region_metadata(region_id)
+    default_cat_label = "AllWISE" if str(region_info.get("catalogue", "")).lower() == "allwise" else "Gaia DR3"
     crossmatch_map: Dict[str, CrossmatchResult] = {}
     cat_row_count = 0
-    cat_name = "Gaia DR3"
+    cat_name = default_cat_label
 
     if cat_files:
         cat_file = cat_files[0]
+        if "allwise" in cat_file.name.lower():
+            cat_name = "AllWISE"
+        elif "gaia" in cat_file.name.lower():
+            cat_name = "Gaia DR3"
+
         with open(cat_file, "r", encoding="utf-8") as cf:
             cat_row_count = sum(1 for line in cf if line.strip() and not line.startswith("#")) - 1
 
         xm_list = crossmatch_sources(sources, cat_file, obs_time_iso=ref_exp.time, max_radius_arcsec=6.15)
         for xm in xm_list:
             crossmatch_map[xm.source_id] = xm
-        print(f"      Crossmatched {len(sources)} sources against {cat_file.name} ({cat_row_count} catalogue rows).")
+            if xm.catalogue_name:
+                cat_name = xm.catalogue_name
+        print(f"      Crossmatched {len(sources)} sources against {cat_file.name} ({cat_row_count} {cat_name} rows).")
     else:
         print("      [Notice] No cached catalogue CSV found. Proceeding with null catalogue matches.")
 
-    # 4. Create Common North-Up TAN WCS Grid
-    region_info = get_region_metadata(region_id)
+    # 4. Create Common North-Up TAN WCS Grid (15.0' -> 146x146 px at 6.15"/px; larger cutouts scale cleanly)
     grid_ra = float(region_info.get("ra_deg", 270.3317))
     grid_dec = float(region_info.get("dec_deg", 66.5614))
-    grid_w, grid_h = 146, 146
+    size_arcmin = float(region_info.get("size_arcmin", 15.0))
+    grid_w = max(146, int(round((size_arcmin * 60.0) / 6.15)))
+    grid_h = grid_w
     common_wcs = make_common_wcs(grid_ra, grid_dec, pixel_scale_arcsec=6.15, size_pix=grid_w)
 
     # 5. Measure central wavelength and sort exposures
@@ -396,10 +537,13 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
         if exp.file_name == ref_exp.file_name:
             ref_exp_id = exp_id
 
-        # Render display image on common North-Up grid
+        # Render display image on common North-Up grid (write once, copy bytes to extra mirror folders)
         png_name = f"{exp_id}.png"
-        png_path = images_dir / png_name
-        vmin, vmax, pct_good = render_display_png(exp, common_wcs, png_path, width=grid_w, height=grid_h)
+        primary_png = region_export_web / "images" / png_name
+        vmin, vmax, pct_good = render_display_png(exp, common_wcs, primary_png, width=grid_w, height=grid_h)
+        png_bytes = primary_png.read_bytes()
+        for extra_dir in target_dirs[1:]:
+            (extra_dir / "images" / png_name).write_bytes(png_bytes)
 
         exposures_export.append({
             "index": idx,
@@ -463,7 +607,7 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
 
         # Calculate pixel position on the common North-Up grid
         if common_wcs is not None and SkyCoord is not None:
-            c = SkyCoord(ra=src.ra_deg, dec=dec_deg, unit="deg", frame="icrs") if "dec_deg" in locals() else SkyCoord(ra=src.ra_deg, dec=src.dec_deg, unit="deg", frame="icrs")
+            c = SkyCoord(ra=src.ra_deg, dec=src.dec_deg, unit="deg", frame="icrs")
             gx, gy = common_wcs.world_to_pixel(c)
             x_common = round(float(gx), 2)
             y_common = round(float(gy), 2)
@@ -475,7 +619,7 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
         xm = crossmatch_map.get(src.id)
         if xm and xm.gaia_id:
             match_data = {
-                "catalogue": "Gaia DR3",
+                "catalogue": xm.catalogue_name or cat_name,
                 "identifier": xm.gaia_id,
                 "separation_arcsec": round(xm.separation_arcsec, 2),
                 "n_candidates_in_radius": xm.candidates_in_radius,
@@ -519,6 +663,16 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
             f"exceeds the 1% error tolerance limit across all {total_spectrum_pts:,} points!"
         )
 
+    # Identify real epoch pairs (>= 14 days apart on same detector within 2% wavelength)
+    epoch_pairs = compute_epoch_pairs_from_exposures(exposures_export)
+    notes_list = ["One exposure gives one spectral point per source"]
+    if epoch_pairs:
+        notes_list.append(
+            f"Found {len(epoch_pairs)} exposure pair(s) >= 14 days apart for multi-epoch inspection"
+        )
+    else:
+        notes_list.append("No epoch pairs in this data: moving-object mode is not available")
+
     # 7. Build Manifest
     manifest_doc = {
         "kind": "real",
@@ -530,7 +684,9 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
             "name": region_info.get("name", region_id.replace("-", " ").title()),
             "ra_deg": grid_ra,
             "dec_deg": grid_dec,
-            "size_arcmin": float(region_info.get("size_arcmin", 15.0))
+            "size_arcmin": size_arcmin,
+            "target_identifiers": region_info.get("target_identifiers"),
+            "description": region_info.get("description")
         },
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "counts": {
@@ -540,7 +696,8 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
             "null_points": total_null_pts,
             "unplaceable_points": total_unplaceable_pts,
             "suspect_points": total_suspect_pts,
-            "suspect_reasons": suspect_counts_by_reason
+            "suspect_reasons": suspect_counts_by_reason,
+            "epoch_pairs": len(epoch_pairs)
         },
         "units": {
             "flux": "uJy",
@@ -565,10 +722,8 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
             "height": grid_h,
             "north_up": True
         },
-        "notes": [
-            "One exposure gives one spectral point per source",
-            "No epoch pairs in this data: moving-object mode is not available"
-        ]
+        "epoch_pairs": epoch_pairs,
+        "notes": notes_list
     }
 
     # 8. Write All JSON Files with allow_nan=False
@@ -582,43 +737,66 @@ def export_region_data(region_id: str = "north-ecliptic-pole"):
 
     for filename, data in json_targets:
         clean_data = sanitize_json(data)
+        serialized = json.dumps(clean_data, indent=2, allow_nan=False)
+        for d in target_dirs:
+            (d / filename).write_text(serialized, encoding="utf-8")
 
-        # Write to web/public/real/
-        dest_file = WEB_EXPORT_DIR / filename
-        with open(dest_file, "w", encoding="utf-8") as f:
-            json.dump(clean_data, f, indent=2, allow_nan=False)
-
-        # Mirror to public/real/ if directory exists
-        if ROOT_EXPORT_DIR.parent.exists():
-            ROOT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-            with open(ROOT_EXPORT_DIR / filename, "w", encoding="utf-8") as f:
-                json.dump(clean_data, f, indent=2, allow_nan=False)
-
+        dest_file = region_export_web / filename
         print(f"      -> {filename} ({dest_file.stat().st_size:,} bytes)")
 
-    # Also mirror README.txt to root public/real if available
-    if ROOT_EXPORT_DIR.exists():
-        with open(ROOT_EXPORT_DIR / "README.txt", "w", encoding="utf-8") as f:
-            f.write("Generated from real SPHEREx QR2 files by export_region.py. Do not edit by hand.\n")
+    update_regions_index()
 
     print("\n-----------------------------------------------------------------")
     print(f"[SUCCESS] Export complete for region '{region_id}'!")
     print(f"  Exposures exported: {len(exposures_export)}")
     print(f"  Sources exported: {len(sources_export)}")
     print(f"  Total spectrum points: {total_spectrum_pts:,} ({total_null_pts:,} null points)")
-    print(f"  Location: {WEB_EXPORT_DIR.relative_to(REPO_ROOT)}/")
+    print(f"  Epoch pairs (>= 14 days): {len(epoch_pairs)}")
+    print(f"  Location: {region_export_web.relative_to(REPO_ROOT)}/")
     print("-----------------------------------------------------------------")
 
     # Run Spectral Dip Diagnostics on the top brightest sources
     run_diagnostics(sources=sources_export, spectra=spectra_export, num_top_sources=5)
 
 
+def export_all_cached_regions():
+    """Exports every region present in cache/spherex/ that contains FITS cutouts."""
+    if not CACHE_SPHEREX.exists():
+        print(f"[FATAL ERROR] Cache directory does not exist: {CACHE_SPHEREX}")
+        print("Please run 'python pipeline/fetch_spherex.py' first.")
+        sys.exit(1)
+
+    configured = [r.get("id") for r in load_regions_config() if r.get("id")]
+    cached_dirs = {
+        d.name: d
+        for d in CACHE_SPHEREX.iterdir()
+        if d.is_dir() and any(d.glob("*.fits"))
+    }
+    ordered_ids = [rid for rid in configured if rid in cached_dirs] + sorted(
+        rid for rid in cached_dirs if rid not in configured
+    )
+
+    if not ordered_ids:
+        print(f"[FATAL ERROR] No cached FITS cutouts found in {CACHE_SPHEREX}.")
+        sys.exit(1)
+
+    root_region = "north-ecliptic-pole" if "north-ecliptic-pole" in ordered_ids else ordered_ids[0]
+    for rid in ordered_ids:
+        export_region_data(rid, write_root=(rid == root_region))
+
+    print(f"\n[ALL REGIONS COMPLETE] Exported {len(ordered_ids)} region(s): {', '.join(ordered_ids)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export real SPHEREx results to web/public/real/.")
     parser.add_argument("region", nargs="?", default="north-ecliptic-pole", help="Region ID to export.")
+    parser.add_argument("--all", action="store_true", help="Export all downloaded regions found in cache/spherex/.")
     args = parser.parse_args()
 
-    export_region_data(args.region)
+    if args.all or args.region.lower() == "all":
+        export_all_cached_regions()
+    else:
+        export_region_data(args.region, write_root=True)
 
 
 if __name__ == "__main__":

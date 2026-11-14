@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
+  ExportedRegionSummary,
   RealDataset,
   RealExposure,
   RealSource,
@@ -7,12 +8,22 @@ import {
   pixelToSky,
 } from '../data/real.ts';
 import { DataSourceChip } from './DataSourceChip.tsx';
-import { TargetObject, SpectralBand } from '../data/spherexData.ts';
+import {
+  CONFIGURED_SKY_REGIONS,
+  SPHEREX_BANDS,
+  SPHEREX_TARGETS,
+  SpectralBand,
+  TargetObject,
+} from '../data/spherexData.ts';
 
 interface ExplorerPageProps {
   // Real dataset props
   dataSource: 'real' | 'fixture';
   realDataset: RealDataset | null;
+  availableRegions?: ExportedRegionSummary[];
+  activeRegionId?: string;
+  onSelectRegion?: (regionId: string) => void;
+  onSelectFixtureRegion?: (regionId: string) => void;
   missingDetails?: {
     files: string[];
     keys: string[];
@@ -87,6 +98,10 @@ const DETECTOR_COLORS: Record<number, { bg: string; text: string; hex: string }>
 export const ExplorerPage: React.FC<ExplorerPageProps> = ({
   dataSource,
   realDataset,
+  availableRegions = [],
+  activeRegionId,
+  onSelectRegion,
+  onSelectFixtureRegion,
   missingDetails,
   selectedRealExposure,
   onSelectRealExposure,
@@ -101,6 +116,10 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
   colormap: initialColormap,
 }) => {
   const isReal = dataSource === 'real' && realDataset !== null;
+  const imageBasePath = realDataset?.basePath || '/real';
+  const gridW = realDataset?.manifest.common_grid?.width || 146;
+  const gridH = realDataset?.manifest.common_grid?.height || 146;
+  const catalogueName = realDataset?.manifest.catalogue?.name || 'Gaia DR3';
 
   // Active colormap: 'infrared' | 'grayscale' | 'inverted'
   const [activeColormap, setActiveColormap] = useState<'infrared' | 'grayscale' | 'inverted'>('infrared');
@@ -130,38 +149,107 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
   const lastBBoxRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
   const hasFittedRef = useRef<boolean>(false);
 
-  // 1. Exposures & Sources from real dataset
-  const exposures = useMemo(() => realDataset?.exposures || [], [realDataset]);
-  const sources = useMemo(() => realDataset?.sources || [], [realDataset]);
-  const currentExposure = selectedRealExposure || exposures[0] || null;
-  const currentSource = selectedRealSource || sources[0] || null;
+  // 1. Exposures & Sources (Real Dataset OR Interactive 102-Band Fixture Dataset)
+  const fixtureExposures = useMemo<RealExposure[]>(
+    () =>
+      SPHEREX_BANDS.map((b, idx) => ({
+        index: idx,
+        id: `B${String(b.bandNumber).padStart(3, '0')}`,
+        file: 'fixture',
+        wavelength_um: b.wavelength,
+        bandwidth_um: 0.04,
+        detector: Number(b.detector.replace(/\D/g, '')) || 1,
+        time_utc: 'Fixture Model',
+        image: '',
+        wavelength_min_um: b.wavelength - 0.02,
+        wavelength_max_um: b.wavelength + 0.02,
+        vmin: 0,
+        vmax: 1,
+        pct_good_pixels: 100,
+      })),
+    []
+  );
 
-  // Spectrum points for current selected source
+  const fixtureSpectrum = useMemo<RealSpectrumPoint[]>(() => {
+    return currentTarget.sedData.map((pt) => {
+      const bandMeta = SPHEREX_BANDS[pt.band - 1];
+      const det = bandMeta ? Number(bandMeta.detector.replace(/\D/g, '')) || 1 : 1;
+      return {
+        exposure_id: `B${String(pt.band).padStart(3, '0')}`,
+        wavelength_um: pt.wavelength,
+        bandwidth_um: null,
+        flux_uJy: pt.flux,
+        flux_err_uJy: pt.fluxError,
+        detector: det,
+        time_utc: 'Fixture Model',
+        n_good_pixels: 12,
+        quality: 'ok',
+        quality_reasons: [],
+        null_reason: null,
+      };
+    });
+  }, [currentTarget]);
+
+  const realExposures = useMemo(() => realDataset?.exposures || [], [realDataset]);
+  const exposures = isReal ? realExposures : fixtureExposures;
+  const sources = useMemo(() => realDataset?.sources || [], [realDataset]);
+
+  const currentExposure = useMemo(() => {
+    if (isReal) return selectedRealExposure || realExposures[0] || null;
+    const bandId = `B${String(currentBand.bandNumber).padStart(3, '0')}`;
+    return fixtureExposures.find((e) => e.id === bandId) || fixtureExposures[0] || null;
+  }, [isReal, selectedRealExposure, realExposures, fixtureExposures, currentBand]);
+
+  const currentSource = isReal ? selectedRealSource || sources[0] || null : null;
+
+  // Spectrum points for current selected source or fixture target
   const currentSpectrum = useMemo<RealSpectrumPoint[]>(() => {
+    if (!isReal) return fixtureSpectrum;
     if (!realDataset || !currentSource) return [];
     return realDataset.spectra[currentSource.id] || [];
-  }, [realDataset, currentSource]);
+  }, [isReal, fixtureSpectrum, realDataset, currentSource]);
+
+  const handleSelectExposureUnified = useCallback(
+    (exp: RealExposure) => {
+      if (isReal) {
+        onSelectRealExposure(exp);
+      } else {
+        const bandNum = Number(exp.id.replace(/\D/g, '')) || 1;
+        const bandObj = SPHEREX_BANDS.find((b) => b.bandNumber === bandNum) || SPHEREX_BANDS[0];
+        onSelectBand(bandObj);
+      }
+    },
+    [isReal, onSelectRealExposure, onSelectBand]
+  );
+
+  // Reset viewer fit and transient hover state when switching active region or fixture target
+  useEffect(() => {
+    hasFittedRef.current = false;
+    lastBBoxRef.current = null;
+    setHoveredPoint(null);
+    setHoveredSourceId(null);
+  }, [realDataset?.manifest.region.id, currentTarget.id, isReal]);
 
   // Preload neighbouring exposures for instantaneous switching
   useEffect(() => {
-    if (!exposures.length || !currentExposure) return;
-    const curIdx = exposures.findIndex((e) => e.id === currentExposure.id);
+    if (!isReal || !realExposures.length || !currentExposure) return;
+    const curIdx = realExposures.findIndex((e) => e.id === currentExposure.id);
     const indicesToPreload = [curIdx - 2, curIdx - 1, curIdx + 1, curIdx + 2].filter(
-      (idx) => idx >= 0 && idx < exposures.length
+      (idx) => idx >= 0 && idx < realExposures.length
     );
 
     for (const idx of indicesToPreload) {
-      const exp = exposures[idx];
-      const imgUrl = `/real/${exp.image}`;
+      const exp = realExposures[idx];
+      const imgUrl = `${imageBasePath}/${exp.image}`;
       if (!imageCacheRef.current.has(imgUrl)) {
         const img = new Image();
         img.src = imgUrl;
         imageCacheRef.current.set(imgUrl, img);
       }
     }
-  }, [exposures, currentExposure]);
+  }, [isReal, realExposures, currentExposure, imageBasePath]);
 
-  // Keyboard navigation for exposures: '[' for previous, ']' for next
+  // Keyboard navigation for exposures / bands: '[' for previous, ']' for next
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -170,17 +258,17 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
       if (e.key === '[') {
         e.preventDefault();
         const prevIdx = Math.max(0, curIdx - 1);
-        onSelectRealExposure(exposures[prevIdx]);
+        handleSelectExposureUnified(exposures[prevIdx]);
       } else if (e.key === ']') {
         e.preventDefault();
         const nextIdx = Math.min(exposures.length - 1, curIdx + 1);
-        onSelectRealExposure(exposures[nextIdx]);
+        handleSelectExposureUnified(exposures[nextIdx]);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [exposures, currentExposure, onSelectRealExposure]);
+  }, [exposures, currentExposure, handleSelectExposureUnified]);
 
   // Fits viewer to bounding box of valid non-transparent pixels with 16px padding
   const fitViewerToBBox = useCallback((bbox: { minX: number; minY: number; maxX: number; maxY: number }) => {
@@ -205,14 +293,14 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
     const bboxCenterX = (bbox.minX + bbox.maxX) / 2.0;
     const bboxCenterY = (bbox.minY + bbox.maxY) / 2.0;
 
-    const dispCenterX = (bboxCenterX / 145) * 146 * clampedZoom;
-    const dispCenterY = (bboxCenterY / 145) * 146 * clampedZoom;
+    const dispCenterX = (bboxCenterX / Math.max(1, gridW - 1)) * gridW * clampedZoom;
+    const dispCenterY = (bboxCenterY / Math.max(1, gridH - 1)) * gridH * clampedZoom;
 
     setPanOffset({
       x: cW / 2 - dispCenterX,
       y: cH / 2 - dispCenterY,
     });
-  }, []);
+  }, [gridW, gridH]);
 
   // Observe container resize to maintain fit with 16px padding
   useEffect(() => {
@@ -227,26 +315,92 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
     return () => ro.disconnect();
   }, [fitViewerToBBox]);
 
-  // Render Image onto Canvas with selected Colormap
+  // Render Image onto Canvas with selected Colormap (Real FITS PNG or Interactive Fixture Sky Plate)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    if (!isReal || !currentExposure) {
-      // Render simple synthetic backdrop for fallback
-      ctx.fillStyle = '#08090b';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = '#6b7280';
-      ctx.font = '12px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('Synthetic Fallback Plate', canvas.width / 2, canvas.height / 2);
+    if (!isReal || !currentExposure?.image) {
+      const w = canvas.width;
+      const h = canvas.height;
+      const imgData = ctx.createImageData(w, h);
+      const d = imgData.data;
+
+      // Seed deterministically from target ID so each star/binary has its own field pattern
+      let idHash = 0;
+      for (let i = 0; i < currentTarget.id.length; i++) {
+        idHash = (idHash * 31 + currentTarget.id.charCodeAt(i)) % 9973;
+      }
+
+      const activeSed = currentTarget.sedData[currentBand.bandNumber - 1];
+      const maxSedFlux = Math.max(...currentTarget.sedData.map((s) => s.flux), 1);
+      const bandGain = activeSed ? 0.55 + 0.45 * (activeSed.flux / maxSedFlux) : 0.85;
+
+      // Star list: central target + optional binary companion + 18 seeded field stars
+      const stars: Array<{ x: number; y: number; amp: number; sigma: number }> = [
+        { x: w * 0.5, y: h * 0.5, amp: 0.98 * bandGain, sigma: 2.3 },
+      ];
+      if (currentTarget.id === 'EPSILON-INDI') {
+        stars.push({ x: w * 0.67, y: h * 0.36, amp: 0.55 * bandGain, sigma: 1.9 });
+      } else if (currentTarget.id === 'RW-AURIGAE') {
+        stars.push({ x: w * 0.55, y: h * 0.47, amp: 0.72 * bandGain, sigma: 1.8 });
+      }
+      for (let s = 0; s < 18; s++) {
+        const sx = 14 + (((Math.sin(idHash + s * 19.7) * 0.5 + 0.5)) * (w - 28));
+        const sy = 14 + (((Math.cos(idHash + s * 37.3) * 0.5 + 0.5)) * (h - 28));
+        if (Math.hypot(sx - w * 0.5, sy - h * 0.5) < 12) continue;
+        const amp = 0.25 + ((Math.sin(s * 7.1 + idHash) * 0.5 + 0.5) * 0.48);
+        stars.push({ x: sx, y: sy, amp, sigma: 1.4 });
+      }
+
+      for (let py = 0; py < h; py++) {
+        for (let px = 0; px < w; px++) {
+          // Low background noise
+          const noise = (Math.sin(px * 12.9898 + py * 78.233 + currentBand.bandNumber) * 43758.5453) % 1;
+          let val = 0.04 + Math.abs(noise) * 0.045;
+          for (const st of stars) {
+            const r2 = (px - st.x) * (px - st.x) + (py - st.y) * (py - st.y);
+            if (r2 < 64) {
+              val += st.amp * Math.exp(-r2 / (2 * st.sigma * st.sigma));
+            }
+          }
+          const v = Math.max(0, Math.min(1, val));
+          const idx = (py * w + px) * 4;
+          if (activeColormap === 'grayscale') {
+            const g = Math.round(v * 255);
+            d[idx] = g;
+            d[idx + 1] = g;
+            d[idx + 2] = g;
+          } else if (activeColormap === 'inverted') {
+            const g = 255 - Math.round(v * 255);
+            d[idx] = g;
+            d[idx + 1] = g;
+            d[idx + 2] = g;
+          } else {
+            const [r, g, b] = createInfraredRamp(v);
+            d[idx] = r;
+            d[idx + 1] = g;
+            d[idx + 2] = b;
+          }
+          d[idx + 3] = 255;
+        }
+      }
+
+      ctx.putImageData(imgData, 0, 0);
+
+      const bbox = { minX: 6, minY: 6, maxX: w - 7, maxY: h - 7 };
+      lastBBoxRef.current = bbox;
+      if (!hasFittedRef.current) {
+        fitViewerToBBox(bbox);
+        hasFittedRef.current = true;
+      }
       return;
     }
 
-    const imgUrl = `/real/${currentExposure.image}`;
-    let img = imageCacheRef.current.get(imgUrl);
+    const imgUrl = `${imageBasePath}/${currentExposure.image}`;
+    const img = imageCacheRef.current.get(imgUrl);
 
     const drawProcessedImage = (imageEl: HTMLImageElement) => {
       const w = canvas.width;
@@ -285,7 +439,6 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
           const v = gray / 255.0;
 
           if (activeColormap === 'grayscale') {
-            // Already grayscale
             continue;
           } else if (activeColormap === 'inverted') {
             d[idx] = 255 - gray;
@@ -331,7 +484,7 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
         ctx.fillText(`Image ${currentExposure.image} not available`, canvas.width / 2, canvas.height / 2);
       };
     }
-  }, [isReal, currentExposure, activeColormap, fitViewerToBBox]);
+  }, [isReal, currentExposure, currentTarget, currentBand, activeColormap, fitViewerToBBox, imageBasePath]);
 
   // Mouse Move over Canvas -> calculate Sky Coordinates and forward to status bar
   const handleCanvasMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -339,33 +492,53 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
     const mouseX = e.clientX - rect.left - panOffset.x;
     const mouseY = e.clientY - rect.top - panOffset.y;
 
-    const displaySize = 146 * zoomLevel;
-    const normX = (mouseX / displaySize) * 145;
-    const normY = (mouseY / displaySize) * 145;
+    const displayW = gridW * zoomLevel;
+    const displayH = gridH * zoomLevel;
+    const maxXIdx = Math.max(1, gridW - 1);
+    const maxYIdx = Math.max(1, gridH - 1);
+    const normX = (mouseX / displayW) * maxXIdx;
+    const normY = (mouseY / displayH) * maxYIdx;
 
-    if (normX >= 0 && normX <= 145 && normY >= 0 && normY <= 145 && realDataset?.manifest.common_grid) {
-      const sky = pixelToSky(normX, normY, realDataset.manifest.common_grid);
-      onCursorMove({
-        ra_deg: sky.ra_deg,
-        dec_deg: sky.dec_deg,
-        exposure_id: currentExposure?.id || null,
-        wavelength_um: currentExposure?.wavelength_um || null,
-        detector: currentExposure?.detector || null,
-        zoom: zoomLevel,
-        selectedSourceId: currentSource?.id || null,
-      });
+    if (normX >= 0 && normX <= maxXIdx && normY >= 0 && normY <= maxYIdx) {
+      if (realDataset?.manifest.common_grid) {
+        const sky = pixelToSky(normX, normY, realDataset.manifest.common_grid);
+        onCursorMove({
+          ra_deg: sky.ra_deg,
+          dec_deg: sky.dec_deg,
+          exposure_id: currentExposure?.id || null,
+          wavelength_um: currentExposure?.wavelength_um || null,
+          detector: currentExposure?.detector || null,
+          zoom: zoomLevel,
+          selectedSourceId: currentSource?.id || null,
+        });
+      } else {
+        // Approximate TAN projection around currentTarget (6.15 arcsec/px)
+        const pixScaleDeg = 6.15 / 3600;
+        const cosDec = Math.max(0.1, Math.cos((currentTarget.decDeg * Math.PI) / 180));
+        const ra = currentTarget.raDeg - ((normX - gridW / 2) * pixScaleDeg) / cosDec;
+        const dec = currentTarget.decDeg - (normY - gridH / 2) * pixScaleDeg;
+        onCursorMove({
+          ra_deg: ra,
+          dec_deg: dec,
+          exposure_id: currentExposure?.id || null,
+          wavelength_um: currentExposure?.wavelength_um || null,
+          detector: currentExposure?.detector || null,
+          zoom: zoomLevel,
+          selectedSourceId: currentTarget.id,
+        });
+      }
     }
   };
 
   const handleCanvasMouseLeave = () => {
     onCursorMove({
-      ra_deg: null,
-      dec_deg: null,
+      ra_deg: isReal ? null : currentTarget.raDeg,
+      dec_deg: isReal ? null : currentTarget.decDeg,
       exposure_id: currentExposure?.id || null,
       wavelength_um: currentExposure?.wavelength_um || null,
       detector: currentExposure?.detector || null,
       zoom: zoomLevel,
-      selectedSourceId: currentSource?.id || null,
+      selectedSourceId: isReal ? (currentSource?.id || null) : currentTarget.id,
     });
   };
 
@@ -407,21 +580,24 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
   const centerOnSource = useCallback((src: RealSource) => {
     onSelectRealSource(src);
     // Center the viewer plate around this source
-    const displaySize = 146 * zoomLevel;
-    const plateWidth = 480;
-    const plateHeight = 480;
-    const srcDispX = (src.x / 145) * displaySize;
-    const srcDispY = (src.y / 145) * displaySize;
+    const container = viewerContainerRef.current;
+    const plateWidth = container?.clientWidth || 480;
+    const plateHeight = container?.clientHeight || 480;
+    const displayW = gridW * zoomLevel;
+    const displayH = gridH * zoomLevel;
+    const srcDispX = (src.x / Math.max(1, gridW - 1)) * displayW;
+    const srcDispY = (src.y / Math.max(1, gridH - 1)) * displayH;
 
     setPanOffset({
       x: plateWidth / 2 - srcDispX,
       y: plateHeight / 2 - srcDispY,
     });
-  }, [zoomLevel, onSelectRealSource]);
+  }, [zoomLevel, onSelectRealSource, gridW, gridH]);
 
-  // Export Spectrum CSV with quality fields
+  // Export Spectrum CSV with quality fields (Real source or Fixture target)
   const handleExportCSV = () => {
-    if (!currentSource || !currentSpectrum.length) return;
+    const exportId = isReal ? currentSource?.id : currentTarget.id;
+    if (!exportId || !currentSpectrum.length) return;
     const headers = [
       'exposure_id',
       'wavelength_um',
@@ -455,7 +631,7 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `SPHEREx_${currentSource.id}_spectrum.csv`;
+    link.download = `SPHEREx_${exportId}_spectrum.csv`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -615,22 +791,74 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
     <div className="w-full pt-14 pb-10 flex-1 flex flex-col bg-surface overflow-hidden">
       {/* Top Region and Metadata Header Bar */}
       <div className="w-full bg-surface-container-lowest border-b border-surface-container-high/60 px-gutter py-2.5 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-secondary"></span>
-            <span className="font-headline-sm text-sm font-bold text-on-surface">
-              {isReal
-                ? realDataset.manifest.region.name
-                : 'Synthetic Demo Field (Fallback)'}
-            </span>
+            <span className={`w-2 h-2 rounded-full ${isReal ? 'bg-secondary' : 'bg-amber-400'}`}></span>
+            {availableRegions.length > 0 && onSelectRegion ? (
+              <select
+                aria-label="Select sky region or target"
+                value={activeRegionId || realDataset?.manifest.region.id || ''}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  const isExported = availableRegions.some((r) => r.id === val);
+                  if (isExported) {
+                    onSelectRegion(val);
+                  } else if (onSelectFixtureRegion) {
+                    onSelectFixtureRegion(val);
+                  }
+                }}
+                className="bg-surface-container border border-surface-container-high rounded px-2 py-0.5 font-headline-sm text-sm font-bold text-on-surface cursor-pointer outline-none focus:border-primary"
+              >
+                {CONFIGURED_SKY_REGIONS.map((cfg) => {
+                  const isExported = availableRegions.some((r) => r.id === cfg.id);
+                  return (
+                    <option key={cfg.id} value={cfg.id}>
+                      {cfg.name}{isExported ? '' : ' (Fixture Preview)'}
+                    </option>
+                  );
+                })}
+                {availableRegions
+                  .filter((r) => !CONFIGURED_SKY_REGIONS.some((c) => c.id === r.id))
+                  .map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name}
+                    </option>
+                  ))}
+              </select>
+            ) : (
+              <select
+                aria-label="Select benchmark target"
+                value={currentTarget.id}
+                onChange={(e) => {
+                  const nextTgt = SPHEREX_TARGETS.find((t) => t.id === e.target.value);
+                  if (nextTgt) onSelectTarget(nextTgt);
+                }}
+                className="bg-surface-container border border-surface-container-high rounded px-2 py-0.5 font-headline-sm text-sm font-bold text-on-surface cursor-pointer outline-none focus:border-primary max-w-[260px] sm:max-w-xs"
+              >
+                {SPHEREX_TARGETS.map((tgt) => (
+                  <option key={tgt.id} value={tgt.id}>
+                    {tgt.name}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
 
           <span className="text-outline-variant text-xs">·</span>
 
           <span className="font-data-mono-sm text-xs text-outline">
-            RA {isReal ? realDataset.manifest.region.ra_deg.toFixed(4) : currentTarget.raHMS}° · DEC{' '}
-            {isReal ? realDataset.manifest.region.dec_deg.toFixed(4) : currentTarget.decDMS}° · {isReal ? realDataset.manifest.region.size_arcmin : '15'} arcmin
+            RA {isReal ? `${realDataset.manifest.region.ra_deg.toFixed(4)}°` : currentTarget.raHMS} · DEC{' '}
+            {isReal ? `${realDataset.manifest.region.dec_deg.toFixed(4)}°` : currentTarget.decDMS} · {isReal ? realDataset.manifest.region.size_arcmin : '15'} arcmin
           </span>
+
+          {isReal && realDataset.manifest.region.target_identifiers && (
+            <>
+              <span className="text-outline-variant text-xs">·</span>
+              <span className="font-data-mono-sm text-[11px] text-secondary">
+                {realDataset.manifest.region.target_identifiers}
+              </span>
+            </>
+          )}
 
           <DataSourceChip dataSource={dataSource} missingDetails={missingDetails} />
         </div>
@@ -725,8 +953,8 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
             <div
               className="relative transition-transform duration-75"
               style={{
-                width: `${146 * zoomLevel}px`,
-                height: `${146 * zoomLevel}px`,
+                width: `${gridW * zoomLevel}px`,
+                height: `${gridH * zoomLevel}px`,
                 transform: `translate(${panOffset.x}px, ${panOffset.y}px)`,
                 imageRendering: 'pixelated',
               }}
@@ -734,59 +962,87 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
               {/* Underlying Clean Canvas */}
               <canvas
                 ref={canvasRef}
-                width={146}
-                height={146}
+                width={gridW}
+                height={gridH}
                 className="w-full h-full block"
               />
 
-              {/* Source Overlays: 72 Real Sources */}
-              {sources.map((src) => {
-                const isSelected = currentSource?.id === src.id;
-                const isHovered = hoveredSourceId === src.id;
-                const leftPct = (src.x / 145) * 100;
-                const topPct = (src.y / 145) * 100;
+              {/* Source Overlays (Real Mode or Fixture Target + Companion Markers) */}
+              {isReal ? (
+                sources.map((src) => {
+                  const isSelected = currentSource?.id === src.id;
+                  const isHovered = hoveredSourceId === src.id;
+                  const leftPct = (src.x / Math.max(1, gridW - 1)) * 100;
+                  const topPct = (src.y / Math.max(1, gridH - 1)) * 100;
 
-                return (
-                  <div
-                    key={src.id}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onSelectRealSource(src);
-                    }}
-                    onMouseEnter={() => setHoveredSourceId(src.id)}
-                    onMouseLeave={() => setHoveredSourceId(null)}
-                    className="absolute cursor-pointer -translate-x-1/2 -translate-y-1/2 group"
-                    style={{ left: `${leftPct}%`, top: `${topPct}%` }}
-                  >
-                    {/* Ring Marker */}
+                  return (
                     <div
-                      className={`rounded-full transition-all ${
-                        isSelected
-                          ? 'w-5 h-5 border-2 border-secondary shadow-[0_0_8px_rgba(65,222,179,0.8)]'
-                          : isHovered
-                          ? 'w-4 h-4 border border-primary bg-primary/20'
-                          : 'w-3 h-3 border border-secondary/60 hover:border-secondary'
-                      }`}
-                    ></div>
+                      key={src.id}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelectRealSource(src);
+                      }}
+                      onMouseEnter={() => setHoveredSourceId(src.id)}
+                      onMouseLeave={() => setHoveredSourceId(null)}
+                      className="absolute cursor-pointer -translate-x-1/2 -translate-y-1/2 group"
+                      style={{ left: `${leftPct}%`, top: `${topPct}%` }}
+                    >
+                      <div
+                        className={`rounded-full transition-all ${
+                          isSelected
+                            ? 'w-5 h-5 border-2 border-secondary shadow-[0_0_8px_rgba(65,222,179,0.8)]'
+                            : isHovered
+                            ? 'w-4 h-4 border border-primary bg-primary/20'
+                            : 'w-3 h-3 border border-secondary/60 hover:border-secondary'
+                        }`}
+                      ></div>
 
-                    {/* Label */}
-                    {(isSelected || isHovered) && (
-                      <div className="absolute top-full left-1/2 -translate-x-1/2 mt-1 px-1.5 py-0.5 rounded bg-surface-container-lowest/95 border border-surface-container-high text-[10px] font-data-mono-sm text-on-surface whitespace-nowrap shadow-xl z-20 pointer-events-none">
-                        <span className="text-secondary font-bold">{src.id}</span>
-                        <span className="text-outline ml-1">Detection SNR {src.peak_snr.toFixed(1)}</span>
-                      </div>
-                    )}
+                      {(isSelected || isHovered) && (
+                        <div className="absolute top-full left-1/2 -translate-x-1/2 mt-1 px-1.5 py-0.5 rounded bg-surface-container-lowest/95 border border-surface-container-high text-[10px] font-data-mono-sm text-on-surface whitespace-nowrap shadow-xl z-20 pointer-events-none">
+                          <span className="text-secondary font-bold">{src.id}</span>
+                          <span className="text-outline ml-1">Detection SNR {src.peak_snr.toFixed(1)}</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              ) : (
+                <>
+                  {/* Central Selected Target Marker */}
+                  <div
+                    className="absolute -translate-x-1/2 -translate-y-1/2 pointer-events-none"
+                    style={{ left: '50%', top: '50%' }}
+                  >
+                    <div className="w-6 h-6 rounded-full border-2 border-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.7)]"></div>
+                    <div className="absolute top-full left-1/2 -translate-x-1/2 mt-1.5 px-2 py-0.5 rounded bg-surface-container-lowest/95 border border-amber-500/50 text-[10px] font-data-mono-sm text-amber-300 whitespace-nowrap shadow-xl">
+                      {currentTarget.id} · Fixture PSF
+                    </div>
                   </div>
-                );
-              })}
+                  {/* Optional Binary Companion Marker */}
+                  {(currentTarget.id === 'EPSILON-INDI' || currentTarget.id === 'RW-AURIGAE') && (
+                    <div
+                      className="absolute -translate-x-1/2 -translate-y-1/2 pointer-events-none"
+                      style={{
+                        left: currentTarget.id === 'EPSILON-INDI' ? '67%' : '55%',
+                        top: currentTarget.id === 'EPSILON-INDI' ? '36%' : '47%',
+                      }}
+                    >
+                      <div className="w-4 h-4 rounded-full border border-secondary/90 shadow-[0_0_6px_rgba(65,222,179,0.6)]"></div>
+                      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 px-1.5 py-0.5 rounded bg-surface-container-lowest/95 border border-secondary/40 text-[9px] font-data-mono-sm text-secondary whitespace-nowrap">
+                        {currentTarget.id === 'EPSILON-INDI' ? 'ε Indi Ba' : 'RW Aur B'}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           </div>
 
-          {/* 120-EXPOSURE RIBBON */}
+          {/* EXPOSURE RIBBON */}
           <div className="border-t border-surface-container-high/60 bg-surface-container-lowest p-2.5 flex flex-col gap-1.5">
             <div className="flex items-center justify-between text-[11px] font-data-mono-sm">
               <span className="text-outline">
-                120 Multi-Extension Exposures (Sorted by Central Wavelength)
+                {exposures.length} {isReal ? 'Multi-Extension Exposures' : 'LVF Spectral Bands'} (Sorted by Central Wavelength)
               </span>
               <span className="text-secondary">
                 Selected: {currentExposure?.id} · {currentExposure?.wavelength_um.toFixed(3)} µm · Det {currentExposure?.detector}
@@ -798,7 +1054,6 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
               <div className="w-full h-full flex items-end justify-between relative">
                 {exposures.map((exp) => {
                   const isSelected = currentExposure?.id === exp.id;
-                  // Check if this exposure gives a null point for selected source
                   const pt = currentSpectrum.find((p) => p.exposure_id === exp.id);
                   const isNull = pt && pt.flux_uJy === null;
                   const nullReason = pt?.null_reason || 'Corrupted or unobserved';
@@ -807,7 +1062,7 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
                   return (
                     <button
                       key={exp.id}
-                      onClick={() => onSelectRealExposure(exp)}
+                      onClick={() => handleSelectExposureUnified(exp)}
                       title={`${exp.id}: ${exp.wavelength_um.toFixed(3)} µm (Det ${exp.detector})${
                         isNull ? ` — Null: ${nullReason}` : ''
                       }`}
@@ -858,7 +1113,11 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
                     : 'border-transparent text-outline hover:text-on-surface'
                 }`}
               >
-                {tab === 'spectrum' ? 'Spectrum' : tab === 'match' ? 'Match (Gaia DR3)' : 'Sources (72)'}
+                {tab === 'spectrum'
+                  ? 'Spectrum'
+                  : tab === 'match'
+                  ? `Match (${isReal ? catalogueName : 'IDs'})`
+                  : `Sources (${isReal ? sources.length : SPHEREX_TARGETS.length})`}
               </button>
             ))}
           </div>
@@ -870,10 +1129,12 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
               <div className="flex items-center justify-between border-b border-surface-container-high/50 pb-2">
                 <div>
                   <span className="font-headline-sm text-base font-bold text-on-surface">
-                    {currentSource?.id || 'SPX-NEP-001'}
+                    {isReal ? (currentSource?.id || 'SPX-NEP-001') : currentTarget.name}
                   </span>
                   <span className="font-data-mono-sm text-xs text-secondary ml-2">
-                    Detection SNR {currentSource?.peak_snr.toFixed(1) || '18.5'}
+                    {isReal
+                      ? `Detection SNR ${currentSource?.peak_snr.toFixed(1) || '18.5'}`
+                      : currentTarget.type}
                   </span>
                 </div>
 
@@ -896,16 +1157,28 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
                 </div>
               </div>
 
-              {/* Disclaimer & Boundary Step Alert */}
-              <div className="p-2.5 rounded bg-surface-container-low border border-surface-container-high text-[11px] font-body-sm text-outline flex flex-col gap-1">
-                <span className="text-amber-300 font-semibold flex items-center gap-1">
-                  <span className="material-symbols-outlined text-[14px]">info</span>
-                  Absolute flux is approximate (nominal pixel solid angle)
-                </span>
-                <span>
-                  Notice: Step changes at detector boundaries (LVF 1–6) can be instrumental.
-                </span>
-              </div>
+              {/* Disclaimer / Fixture Mode Notice */}
+              {isReal ? (
+                <div className="p-2.5 rounded bg-surface-container-low border border-surface-container-high text-[11px] font-body-sm text-outline flex flex-col gap-1">
+                  <span className="text-amber-300 font-semibold flex items-center gap-1">
+                    <span className="material-symbols-outlined text-[14px]">info</span>
+                    Absolute flux is approximate (nominal pixel solid angle)
+                  </span>
+                  <span>
+                    Notice: Step changes at detector boundaries (LVF 1–6) can be instrumental.
+                  </span>
+                </div>
+              ) : (
+                <div className="p-2.5 rounded bg-amber-950/30 border border-amber-500/40 text-[11px] font-body-sm text-amber-200 flex flex-col gap-1">
+                  <span className="text-amber-300 font-semibold flex items-center gap-1">
+                    <span className="material-symbols-outlined text-[14px]">science</span>
+                    Synthetic Fixture Mode — Schematic 102-Band SED Preview
+                  </span>
+                  <span className="text-amber-100/80">
+                    Showing physical SED preview for {currentTarget.name}. Fetch & export local IRSA QR2 cutouts to view calibrated real FITS photometry.
+                  </span>
+                </div>
+              )}
 
               {/* Spectral Chart SVG */}
               <div className="relative w-full bg-surface-container-lowest rounded-lg border border-surface-container-high p-2 flex flex-col">
@@ -1077,7 +1350,7 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
                         onMouseEnter={() => setHoveredPoint(pt)}
                         onClick={() => {
                           const exp = exposures.find((e) => e.id === pt.exposure_id);
-                          if (exp) onSelectRealExposure(exp);
+                          if (exp) handleSelectExposureUnified(exp);
                         }}
                       >
                         {/* Error Bar */}
@@ -1234,14 +1507,53 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
             <div className="p-4 flex flex-col gap-4">
               <div className="flex items-center justify-between border-b border-surface-container-high/50 pb-2">
                 <span className="font-headline-sm text-sm font-bold text-on-surface">
-                  Catalogue Cross-Match: {currentSource?.id}
+                  {isReal
+                    ? `Catalogue Cross-Match: ${currentSource?.id}`
+                    : `Target Identifiers & Notes: ${currentTarget.id}`}
                 </span>
                 <span className="font-data-mono-sm text-xs text-outline">
-                  Radius: 6.15 arcsec
+                  {isReal ? 'Radius: 6.15 arcsec' : currentTarget.field}
                 </span>
               </div>
 
-              {currentSource?.match ? (
+              {!isReal ? (
+                <div className="flex flex-col gap-3 font-data-mono-sm text-xs">
+                  <div className="p-3 rounded-lg bg-surface-container-lowest border border-surface-container-high flex flex-col gap-1.5">
+                    <span className="text-outline text-[10px]">TARGET NAME & CLASSIFICATION:</span>
+                    <span className="text-base font-bold text-secondary">{currentTarget.name}</span>
+                    <span className="text-outline text-xs font-body-sm">{currentTarget.type}</span>
+                    <span className="text-on-surface-variant text-xs mt-1">
+                      RA {currentTarget.raHMS} ({currentTarget.raDeg.toFixed(4)}°) · DEC {currentTarget.decDMS} ({currentTarget.decDeg.toFixed(4)}°)
+                    </span>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-surface-container-lowest border border-surface-container-high flex flex-col gap-2">
+                    <span className="text-outline text-[10px]">CATALOGUE IDENTIFIERS & BENCHMARK NOTES:</span>
+                    <ul className="space-y-1.5 text-xs text-on-surface">
+                      {currentTarget.keyFeatures.map((kf, i) => (
+                        <li key={i} className="flex items-start gap-2">
+                          <span className="text-secondary">•</span>
+                          <span>{kf}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <p className="font-body-sm text-xs text-on-surface-variant leading-relaxed p-3 rounded-lg bg-surface-container-low border border-surface-container-high/70">
+                    {currentTarget.description}
+                  </p>
+
+                  <a
+                    href={`https://ui.adsabs.harvard.edu/search/q=${encodeURIComponent(currentTarget.name.split('(')[0].trim())}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="w-full py-2 px-4 rounded bg-primary-container hover:bg-primary text-on-primary font-body-sm text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <span>Search Target in NASA ADS</span>
+                    <span className="material-symbols-outlined text-[16px]">open_in_new</span>
+                  </a>
+                </div>
+              ) : currentSource?.match ? (
                 <div className="flex flex-col gap-3 font-data-mono-sm text-xs">
                   <div className="p-3 rounded-lg bg-surface-container-lowest border border-surface-container-high flex flex-col gap-2">
                     <span className="text-outline text-[11px]">MATCHED CATALOGUE IDENTIFIER:</span>
@@ -1301,10 +1613,10 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
                 <div className="p-6 rounded-lg bg-surface-container-lowest border border-surface-container-high flex flex-col items-center justify-center text-center gap-2">
                   <span className="material-symbols-outlined text-outline text-[32px]">search_off</span>
                   <span className="font-data-mono-sm text-sm text-on-surface font-semibold">
-                    No Gaia match within 6.15 arcsec
+                    No {catalogueName} match within 6.15 arcsec
                   </span>
                   <p className="font-body-sm text-xs text-outline max-w-xs">
-                    This source has no corresponding counterpart in the Gaia DR3 reference catalogue inside the search beam.
+                    This source has no corresponding counterpart in the {catalogueName} reference catalogue inside the search beam.
                   </p>
                 </div>
               )}
@@ -1317,7 +1629,11 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
               {/* Search input */}
               <input
                 type="text"
-                placeholder="Filter 72 sources by ID or Gaia..."
+                placeholder={
+                  isReal
+                    ? `Filter ${sources.length} sources by ID or ${catalogueName}...`
+                    : `Filter ${SPHEREX_TARGETS.length} benchmark targets by name, Gaia DR3, or SIMBAD ID...`
+                }
                 value={sourceSearch}
                 onChange={(e) => setSourceSearch(e.target.value)}
                 className="w-full px-3 py-1.5 text-xs rounded bg-surface-container-lowest text-on-surface border border-surface-container-high outline-none font-data-mono-sm placeholder:text-outline/60"
@@ -1325,67 +1641,115 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
 
               {/* Table */}
               <div className="flex-1 overflow-y-auto max-h-[480px] border border-surface-container-high rounded-lg">
-                <table className="w-full text-left font-data-mono-sm text-xs border-collapse">
-                  <thead className="sticky top-0 bg-surface-container-lowest z-10 border-b border-surface-container-high text-outline text-[11px]">
-                    <tr>
-                      <th
-                        onClick={() => {
-                          if (sourceSortCol === 'id') setSourceSortAsc(!sourceSortAsc);
-                          else { setSourceSortCol('id'); setSourceSortAsc(true); }
-                        }}
-                        className="py-2 px-2.5 cursor-pointer hover:text-on-surface"
-                      >
-                        Source ID
-                      </th>
-                      <th
-                        onClick={() => {
-                          if (sourceSortCol === 'peak_snr') setSourceSortAsc(!sourceSortAsc);
-                          else { setSourceSortCol('peak_snr'); setSourceSortAsc(false); }
-                        }}
-                        className="py-2 px-2.5 cursor-pointer hover:text-on-surface"
-                      >
-                        SNR
-                      </th>
-                      <th
-                        onClick={() => {
-                          if (sourceSortCol === 'valid_points') setSourceSortAsc(!sourceSortAsc);
-                          else { setSourceSortCol('valid_points'); setSourceSortAsc(false); }
-                        }}
-                        className="py-2 px-2.5 cursor-pointer hover:text-on-surface"
-                      >
-                        Valid Pts
-                      </th>
-                      <th className="py-2 px-2.5">Gaia DR3 Match</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredAndSortedSources.map((s) => {
-                      const isSelected = currentSource?.id === s.id;
-                      return (
-                        <tr
-                          key={s.id}
-                          onClick={() => centerOnSource(s)}
-                          className={`border-b border-surface-container-high/30 transition-colors cursor-pointer ${
-                            isSelected
-                              ? 'bg-primary/20 text-on-surface font-semibold'
-                              : 'hover:bg-surface-container-high/40 text-on-surface-variant'
-                          }`}
+                {isReal ? (
+                  <table className="w-full text-left font-data-mono-sm text-xs border-collapse">
+                    <thead className="sticky top-0 bg-surface-container-lowest z-10 border-b border-surface-container-high text-outline text-[11px]">
+                      <tr>
+                        <th
+                          onClick={() => {
+                            if (sourceSortCol === 'id') setSourceSortAsc(!sourceSortAsc);
+                            else { setSourceSortCol('id'); setSourceSortAsc(true); }
+                          }}
+                          className="py-2 px-2.5 cursor-pointer hover:text-on-surface"
                         >
-                          <td className="py-2 px-2.5 text-secondary">{s.id}</td>
-                          <td className="py-2 px-2.5 font-bold text-on-surface">
-                            {s.peak_snr.toFixed(1)}
-                          </td>
-                          <td className="py-2 px-2.5">
-                            {s.valid_points}/{s.total_points}
-                          </td>
-                          <td className="py-2 px-2.5 text-[11px] truncate max-w-[120px]">
-                            {s.match ? s.match.identifier : '—'}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                          Source ID
+                        </th>
+                        <th
+                          onClick={() => {
+                            if (sourceSortCol === 'peak_snr') setSourceSortAsc(!sourceSortAsc);
+                            else { setSourceSortCol('peak_snr'); setSourceSortAsc(false); }
+                          }}
+                          className="py-2 px-2.5 cursor-pointer hover:text-on-surface"
+                        >
+                          SNR
+                        </th>
+                        <th
+                          onClick={() => {
+                            if (sourceSortCol === 'valid_points') setSourceSortAsc(!sourceSortAsc);
+                            else { setSourceSortCol('valid_points'); setSourceSortAsc(false); }
+                          }}
+                          className="py-2 px-2.5 cursor-pointer hover:text-on-surface"
+                        >
+                          Valid Pts
+                        </th>
+                        <th className="py-2 px-2.5">{catalogueName} Match</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredAndSortedSources.map((s) => {
+                        const isSelected = currentSource?.id === s.id;
+                        return (
+                          <tr
+                            key={s.id}
+                            onClick={() => centerOnSource(s)}
+                            className={`border-b border-surface-container-high/30 transition-colors cursor-pointer ${
+                              isSelected
+                                ? 'bg-primary/20 text-on-surface font-semibold'
+                                : 'hover:bg-surface-container-high/40 text-on-surface-variant'
+                            }`}
+                          >
+                            <td className="py-2 px-2.5 text-secondary">{s.id}</td>
+                            <td className="py-2 px-2.5 font-bold text-on-surface">
+                              {s.peak_snr.toFixed(1)}
+                            </td>
+                            <td className="py-2 px-2.5">
+                              {s.valid_points}/{s.total_points}
+                            </td>
+                            <td className="py-2 px-2.5 text-[11px] truncate max-w-[120px]">
+                              {s.match ? s.match.identifier : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                ) : (
+                  <table className="w-full text-left font-data-mono-sm text-xs border-collapse">
+                    <thead className="sticky top-0 bg-surface-container-lowest z-10 border-b border-surface-container-high text-outline text-[11px]">
+                      <tr>
+                        <th className="py-2 px-2.5">Target Name</th>
+                        <th className="py-2 px-2.5">Coords</th>
+                        <th className="py-2 px-2.5">Bands</th>
+                        <th className="py-2 px-2.5">Primary ID</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {SPHEREX_TARGETS.filter(
+                        (t) =>
+                          t.name.toLowerCase().includes(sourceSearch.toLowerCase()) ||
+                          t.id.toLowerCase().includes(sourceSearch.toLowerCase()) ||
+                          t.keyFeatures.some((k) => k.toLowerCase().includes(sourceSearch.toLowerCase()))
+                      ).map((tgt) => {
+                        const isSelected = currentTarget.id === tgt.id;
+                        return (
+                          <tr
+                            key={tgt.id}
+                            onClick={() => {
+                              onSelectTarget(tgt);
+                              setActiveInspectorTab('spectrum');
+                            }}
+                            className={`border-b border-surface-container-high/30 transition-colors cursor-pointer ${
+                              isSelected
+                                ? 'bg-primary/20 text-on-surface font-semibold'
+                                : 'hover:bg-surface-container-high/40 text-on-surface-variant'
+                            }`}
+                          >
+                            <td className="py-2 px-2.5 text-amber-300 font-semibold max-w-[160px] truncate" title={tgt.name}>
+                              {tgt.name}
+                            </td>
+                            <td className="py-2 px-2.5 text-[10px] text-outline whitespace-nowrap">
+                              {tgt.raDeg.toFixed(2)}°, {tgt.decDeg.toFixed(2)}°
+                            </td>
+                            <td className="py-2 px-2.5">{tgt.sedData.length}/102</td>
+                            <td className="py-2 px-2.5 text-[10px] truncate max-w-[140px]" title={tgt.keyFeatures[0]}>
+                              {tgt.keyFeatures[0] || tgt.id}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
               </div>
             </div>
           )}

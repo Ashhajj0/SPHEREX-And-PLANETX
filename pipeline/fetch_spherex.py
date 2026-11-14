@@ -44,6 +44,8 @@ CACHE_DIR = REPO_ROOT / "cache" / "spherex"
 CONFIG_FILE = REPO_ROOT / "pipeline" / "regions.yaml"
 
 IRSA_TAP_URL = "https://irsa.ipac.caltech.edu/TAP/sync"
+IRSA_TAP_ASYNC_URL = "https://irsa.ipac.caltech.edu/TAP/async"
+IRSA_TAP_BASE_URL = "https://irsa.ipac.caltech.edu/TAP"
 COLLECTION_NAME = "spherex_qr2"
 
 
@@ -95,14 +97,17 @@ def calculate_sha256(file_path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Query IRSA TAP for Real SPHEREx QR2 Cutouts
 # ---------------------------------------------------------------------------
-def query_spherex_cutouts(ra_deg: float, dec_deg: float, size_arcmin: float, max_files: int) -> List[Dict[str, Any]]:
-    """
-    Queries IRSA TAP for SPHEREx QR2 observation cutouts covering the given coordinates.
-    Follows the official IRSA tutorial:
-    https://caltech-ipac.github.io/irsa-tutorials/spherex-cutouts
-    """
+def _build_spherex_adql(
+    ra_deg: float,
+    dec_deg: float,
+    size_arcmin: float,
+    max_files: int,
+    ordered: bool = True,
+) -> str:
+    """Builds the ADQL query against IRSA spherex.artifact & spherex.plane."""
     size_deg = size_arcmin / 60.0
-    adql_query = f"""
+    order_clause = "ORDER BY p.time_bounds_lower" if ordered else ""
+    return f"""
     SELECT TOP {max_files}
         'https://irsa.ipac.caltech.edu/' || a.uri || '?center={ra_deg:.6f},{dec_deg:.6f}d&size={size_deg:.6f}d' AS uri,
         p.time_bounds_lower,
@@ -111,54 +116,336 @@ def query_spherex_cutouts(ra_deg: float, dec_deg: float, size_arcmin: float, max
     FROM spherex.artifact a
     JOIN spherex.plane p ON a.planeid = p.planeid
     WHERE 1 = CONTAINS(POINT('ICRS', {ra_deg:.6f}, {dec_deg:.6f}), p.poly)
-    ORDER BY p.time_bounds_lower
+    {order_clause}
     """.strip()
 
+
+def _execute_sync_tap(adql_query: str, timeout: int = 90) -> str:
+    """Executes synchronous ADQL query against IRSA TAP."""
     params = {
         "REQUEST": "doQuery",
         "LANG": "ADQL",
         "FORMAT": "csv",
-        "QUERY": adql_query
+        "QUERY": adql_query,
     }
     data = urllib.parse.urlencode(params).encode("utf-8")
     req = urllib.request.Request(
         IRSA_TAP_URL,
         data=data,
-        headers={"User-Agent": "SPHEREx-Data-Pipeline/2.0 (IRSA-QR2)"}
+        headers={"User-Agent": "SPHEREx-Data-Pipeline/2.0 (IRSA-QR2)"},
     )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+    if "<INFO" in text and "ERROR" in text:
+        raise RuntimeError(f"IRSA TAP returned error response: {text[:300]}")
+    return text
 
-    print(f"  Sending ADQL query to Caltech/IPAC IRSA TAP...")
+
+def _execute_async_tap(adql_query: str, timeout: int = 180) -> List[Dict[str, Any]]:
+    """
+    Executes asynchronous ADQL query against IRSA TAP (/TAP/async).
+    Async jobs avoid HTTP gateway read timeouts on busy/dense sky fields.
+    """
+    # Prefer pyvo if installed (bundled via requirements.txt)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            text = resp.read().decode("utf-8")
-    except Exception as e:
-        print(f"[FATAL] Failed to query IRSA TAP service: {e}")
-        sys.exit(1)
+        import pyvo
+        tap = pyvo.dal.TAPService(IRSA_TAP_BASE_URL)
+        job = tap.submit_job(adql_query)
+        try:
+            job.run()
+            job.wait(phases=["COMPLETED", "ERROR", "ABORTED"], timeout=float(timeout))
+            job.raise_if_error()
+            table = job.fetch_result().to_table()
+            records: List[Dict[str, Any]] = []
+            for row in table:
+                raw_uri = row["uri"]
+                uri = raw_uri.decode("utf-8", errors="ignore") if isinstance(raw_uri, bytes) else str(raw_uri)
+                if "spherex" in uri:
+                    try:
+                        mjd_val = float(row["time_bounds_lower"])
+                    except Exception:
+                        mjd_val = 0.0
+                    bp = row["energy_bandpassname"]
+                    oid = row["obsid"]
+                    records.append({
+                        "uri": uri,
+                        "time_mjd": mjd_val,
+                        "bandpass": bp.decode("utf-8", errors="ignore") if isinstance(bp, bytes) else str(bp or ""),
+                        "obsid": oid.decode("utf-8", errors="ignore") if isinstance(oid, bytes) else str(oid or ""),
+                    })
+            return records
+        finally:
+            try:
+                job.delete()
+            except Exception:
+                pass
+    except ImportError:
+        pass
+
+    # Pure-Python UWS Async TAP fallback
+    params = {
+        "REQUEST": "doQuery",
+        "LANG": "ADQL",
+        "FORMAT": "csv",
+        "PHASE": "RUN",
+        "QUERY": adql_query,
+    }
+    data = urllib.parse.urlencode(params).encode("utf-8")
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect())
+    req = urllib.request.Request(
+        IRSA_TAP_ASYNC_URL,
+        data=data,
+        headers={"User-Agent": "SPHEREx-Data-Pipeline/2.0 (IRSA-QR2)"},
+    )
+    job_url = None
+    try:
+        with opener.open(req, timeout=45) as resp:
+            job_url = resp.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code in (302, 303) and e.headers.get("Location"):
+            job_url = e.headers.get("Location")
+        else:
+            raise
+
+    if not job_url:
+        raise RuntimeError("IRSA Async TAP did not return a job URL")
+
+    job_url = job_url.rstrip("/")
+    deadline = time.time() + timeout
+    phase = "EXECUTING"
+    while time.time() < deadline:
+        with urllib.request.urlopen(f"{job_url}/phase", timeout=30) as p_resp:
+            phase = p_resp.read().decode("utf-8", errors="replace").strip().upper()
+        if phase in ("COMPLETED", "ERROR", "ABORTED"):
+            break
+        time.sleep(2.5)
+
+    if phase != "COMPLETED":
+        raise RuntimeError(f"IRSA Async TAP job ended with phase={phase}")
+
+    with urllib.request.urlopen(f"{job_url}/results/result", timeout=60) as r_resp:
+        csv_text = r_resp.read().decode("utf-8", errors="replace")
+    return _parse_tap_csv(csv_text)
+
+
+def _parse_tap_csv(text: str) -> List[Dict[str, Any]]:
+    """Parses CSV text returned by IRSA TAP into cutout query records."""
+    import csv
+    import io
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(lines) <= 1:
-        print(f"[FATAL] IRSA TAP returned 0 records for coordinates RA={ra_deg}, Dec={dec_deg}.")
-        print("No matching observations found in collection 'spherex_qr2'. Never inventing fake data.")
-        sys.exit(1)
+        return []
 
-    import csv
-    import io
     reader = csv.DictReader(io.StringIO(text))
-    records = []
+    records: List[Dict[str, Any]] = []
     for row in reader:
         uri = row.get("uri", "")
-        # Enforce that only real spherex qr2 files are processed
         if "spherex" in uri:
             records.append({
                 "uri": uri,
-                "time_mjd": float(row.get("time_bounds_lower", 0.0)),
+                "time_mjd": float(row.get("time_bounds_lower") or 0.0),
                 "bandpass": row.get("energy_bandpassname", ""),
-                "obsid": row.get("obsid", "")
+                "obsid": row.get("obsid", ""),
+            })
+    return records
+
+
+def _short_err(err: Exception) -> str:
+    """Formats verbose HTML HTTP 502/503 proxy errors into a clean one-line summary."""
+    msg = str(err)
+    if "502" in msg and ("Proxy Error" in msg or "<html" in msg.lower()):
+        return "HTTP 502 Proxy Error (Caltech/IPAC IRSA server temporarily unavailable)"
+    if "503" in msg and "<html" in msg.lower():
+        return "HTTP 503 Service Unavailable (Caltech/IPAC IRSA overloaded)"
+    return msg.splitlines()[0][:180]
+
+
+def _query_via_sia(
+    ra_deg: float,
+    dec_deg: float,
+    size_arcmin: float,
+    max_files: int,
+    preferred_collection: str = COLLECTION_NAME,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    Fast indexed search via IRSA SIAv2 (astroquery.ipac.irsa.Irsa.query_sia).
+    Returns None if astroquery/SIA fails so callers can fall back to TAP,
+    or a list of cutout records (possibly empty if verified 0 coverage).
+    """
+    try:
+        from astroquery.ipac.irsa import Irsa
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+    except ImportError:
+        return None
+
+    size_deg = size_arcmin / 60.0
+    coord = SkyCoord(ra=ra_deg, dec=dec_deg, unit="deg", frame="icrs")
+
+    # Discover live SPHEREx collections on IRSA SIA so we always match active release names
+    collections_to_try: List[str] = [preferred_collection]
+    try:
+        coll_tbl = Irsa.list_collections(servicetype="SIA", filter="spherex")
+        if coll_tbl is not None and len(coll_tbl) > 0:
+            col_name = "collection" if "collection" in coll_tbl.colnames else coll_tbl.colnames[0]
+            live = [str(v).strip() for v in coll_tbl[col_name] if "spherex" in str(v).lower()]
+            # Prefer qr2 first, then qr3 / dr1 wide surveys
+            for c in ["spherex_qr2", "spherex_qr3", "spherex_dr1", "spherex_qr3_deep", "spherex_dr1_deep"]:
+                if c in live and c not in collections_to_try:
+                    collections_to_try.append(c)
+            for c in live:
+                if c not in collections_to_try:
+                    collections_to_try.append(c)
+    except Exception:
+        for c in ["spherex_qr3", "spherex_dr1"]:
+            if c not in collections_to_try:
+                collections_to_try.append(c)
+
+    for coll in collections_to_try:
+        print(f"  Trying fast IRSA SIAv2 search (collection='{coll}')...")
+        try:
+            res = Irsa.query_sia(pos=(coord, 1 * u.arcsec), collection=coll)
+        except Exception as e:
+            short = _short_err(e)
+            print(f"    [SIA '{coll}' warning] {short}")
+            if "capabilities" in str(e) and ("502" in str(e) or "503" in str(e)):
+                # /SIA/capabilities is shared across all collections; avoid spamming duplicate 502s
+                break
+            continue
+
+        if res is None or len(res) == 0:
+            print(f"    SIA '{coll}' returned 0 rows for RA={ra_deg:.4f}, Dec={dec_deg:.4f}.")
+            continue
+
+        records: List[Dict[str, Any]] = []
+        seen_urls = set()
+        cols = set(res.colnames)
+
+        for row in res:
+            raw_url = row["access_url"] if "access_url" in cols else ""
+            url = raw_url.decode("utf-8", errors="ignore") if isinstance(raw_url, bytes) else str(raw_url or "")
+            if not url:
+                continue
+
+            fmt = ""
+            if "access_format" in cols:
+                raw_fmt = row["access_format"]
+                fmt = raw_fmt.decode("utf-8", errors="ignore") if isinstance(raw_fmt, bytes) else str(raw_fmt or "")
+            if "datalink" in fmt.lower():
+                continue
+            if ".fits" not in url.lower() and "fits" not in fmt.lower():
+                continue
+
+            # Append IRSA spatial cutout query params so we download ~35 KB cutouts, not full ~150 MB frames
+            if "irsa.ipac.caltech.edu" in url and "?center=" not in url and "&center=" not in url:
+                sep = "&" if "?" in url else "?"
+                cutout_url = f"{url}{sep}center={ra_deg:.6f},{dec_deg:.6f}d&size={size_deg:.6f}d"
+            else:
+                cutout_url = url
+
+            if cutout_url in seen_urls:
+                continue
+            seen_urls.add(cutout_url)
+
+            mjd_val = 0.0
+            if "t_min" in cols:
+                try:
+                    mjd_val = float(row["t_min"])
+                except Exception:
+                    mjd_val = 0.0
+
+            bp_val = ""
+            for bp_col in ("energy_bandpassname", "bandpass_id"):
+                if bp_col in cols and row[bp_col] is not None:
+                    bp_val = str(row[bp_col])
+                    break
+
+            obs_val = ""
+            for obs_col in ("obs_id", "obs_publisher_did"):
+                if obs_col in cols and row[obs_col] is not None:
+                    obs_val = str(row[obs_col])
+                    break
+
+            records.append({
+                "uri": cutout_url,
+                "time_mjd": mjd_val,
+                "bandpass": bp_val,
+                "obsid": obs_val,
+                "collection": coll,
             })
 
+        if records:
+            records.sort(key=lambda r: r.get("time_mjd", 0.0))
+            return records[:max_files]
+
+    return None
+
+
+def query_spherex_cutouts(
+    ra_deg: float,
+    dec_deg: float,
+    size_arcmin: float,
+    max_files: int,
+    timeout: int = 90,
+) -> List[Dict[str, Any]]:
+    """
+    Queries IRSA for SPHEREx observation cutouts covering the given coordinates.
+    Order of attempts for speed & reliability:
+    1. Fast spatially-indexed IRSA SIAv2 (astroquery Irsa.query_sia)
+    2. Fast unordered IRSA Sync TAP (no full-table ORDER BY sort)
+    3. IRSA Asynchronous TAP (/TAP/async) fallback
+    """
+    # 1. Try fast SIAv2 first (avoids TAP polygon join bottlenecks)
+    sia_records = _query_via_sia(ra_deg, dec_deg, size_arcmin, max_files)
+    if sia_records:
+        return sia_records
+
+    unordered_adql = _build_spherex_adql(ra_deg, dec_deg, size_arcmin, max_files, ordered=False)
+    ordered_adql = _build_spherex_adql(ra_deg, dec_deg, size_arcmin, max_files, ordered=True)
+
+    print(f"  Sending fast ADQL query to Caltech/IPAC IRSA TAP (timeout={timeout}s)...")
+    last_err: Optional[Exception] = None
+    records: Optional[List[Dict[str, Any]]] = None
+
+    # 2. Try fast unordered Sync TAP (2 attempts)
+    for attempt in range(1, 3):
+        try:
+            text = _execute_sync_tap(unordered_adql, timeout=timeout)
+            records = _parse_tap_csv(text)
+            records.sort(key=lambda r: r.get("time_mjd", 0.0))
+            break
+        except Exception as e:
+            last_err = e
+            print(f"    [Sync Retry {attempt}/2] IRSA TAP query warning: {_short_err(e)}")
+            time.sleep(2.0 * attempt)
+
+    # 3. Fall back to IRSA Async TAP (/TAP/async)
+    if records is None:
+        print("  Sync TAP timed out/failed; switching to IRSA Asynchronous TAP (/TAP/async)...")
+        try:
+            records = _execute_async_tap(unordered_adql, timeout=max(180, timeout * 2))
+            records.sort(key=lambda r: r.get("time_mjd", 0.0))
+        except Exception as e:
+            last_err = e
+            print(f"    [Async Retry] Unordered query failed ({_short_err(e)}); retrying ordered TAP...")
+            try:
+                records = _execute_async_tap(ordered_adql, timeout=max(180, timeout * 2))
+            except Exception as e2:
+                last_err = e2
+
+    if records is None:
+        raise RuntimeError(f"IRSA queries failed (SIAv2 + Sync TAP + Async TAP): {_short_err(last_err) if last_err else 'Unknown error'}")
+
     if not records:
-        print(f"[FATAL] No valid SPHEREx QR2 cutouts found in query response.")
-        sys.exit(1)
+        print(f"  [NO QR2 COVERAGE] IRSA returned 0 exposures for coordinates RA={ra_deg}, Dec={dec_deg}.")
+        print("  No matching observations found yet. Never inventing fake data.")
+        return []
 
     return records
 
@@ -181,19 +468,21 @@ def download_and_filter_cutout(cutout_url: str, dest_path: Path, max_retries: in
                 cutout_url,
                 headers={"User-Agent": "SPHEREx-Data-Pipeline/2.0 (IRSA-QR2)"}
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw_data = resp.read()
-                if len(raw_data) > 2880 and raw_data.startswith(b"SIMPLE  ="):
-                    break
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                candidate = resp.read()
+            if len(candidate) <= 2880 or not candidate.startswith(b"SIMPLE  ="):
+                raise ValueError(
+                    f"Response was not a valid FITS cutout (len={len(candidate)})"
+                )
+            raw_data = candidate
+            break
         except Exception as e:
             last_err = e
             print(f"    [Retry {attempt}/{max_retries}] Download warning: {e}")
-            time.sleep(1.0 * attempt)
+            time.sleep(1.5 * attempt)
 
     if raw_data is None or len(raw_data) < 2880:
-        print(f"[FATAL] Failed to download cutout from: {cutout_url}")
-        print(f"Error details: {last_err}")
-        sys.exit(1)
+        raise RuntimeError(f"Failed to download cutout from {cutout_url}: {last_err}")
 
     # 2. Parse HDUs and filter out PSF and ZODI extensions to save space
     # Try astropy if available, otherwise pure Python FITS splitter
@@ -417,6 +706,14 @@ def main():
     )
     parser.add_argument("--yes", "-y", action="store_true", help="Auto-confirm download prompt.")
     parser.add_argument("--max-size-gb", type=float, default=2.0, help="Maximum total download size in GB.")
+    parser.add_argument("--timeout", type=int, default=90, help="TAP query timeout in seconds (default: 90).")
+    parser.add_argument("--skip-cached", action="store_true", help="Skip regions that already have a cached manifest.json.")
+    parser.add_argument(
+        "--region",
+        type=str,
+        default="all",
+        help="Region ID to download (or 'all' for all regions in pipeline/regions.yaml)."
+    )
     args = parser.parse_args()
 
     print("=================================================================")
@@ -426,7 +723,18 @@ def main():
 
     offline_mode = os.environ.get("OFFLINE", "0").lower() in ("1", "true", "yes")
     config = load_config(CONFIG_FILE)
-    regions = config.get("regions", [])
+    all_regions = config.get("regions", [])
+
+    if args.region.lower() != "all":
+        requested = {r.strip() for r in args.region.split(",") if r.strip()}
+        regions = [r for r in all_regions if r.get("id") in requested]
+        if not regions:
+            valid_ids = [r.get("id") for r in all_regions]
+            print(f"[FATAL] Region(s) {sorted(requested)} not found in pipeline/regions.yaml.")
+            print(f"Available region IDs: {', '.join(valid_ids)}")
+            sys.exit(1)
+    else:
+        regions = all_regions
 
     if offline_mode:
         print("[OFFLINE MODE ACTIVE] OFFLINE=1 is set. Checking local cache only.\n")
@@ -450,6 +758,10 @@ def main():
         print("\n[PASS] Offline verification complete.")
         sys.exit(0)
 
+    downloaded_regions: List[str] = []
+    no_coverage_regions: List[str] = []
+    failed_regions: List[str] = []
+
     # Online mode: query IRSA TAP and download real cutouts
     for reg in regions:
         reg_id = reg["id"]
@@ -463,10 +775,40 @@ def main():
         manifest_file = reg_dir / "manifest.json"
         epoch_pairs_file = reg_dir / "epoch_pairs.json"
 
+        # Load any previous manifest so resumed cached files keep accurate metadata
+        prev_manifest_map: Dict[str, Dict[str, Any]] = {}
+        if manifest_file.exists():
+            try:
+                with open(manifest_file, "r", encoding="utf-8") as pmf:
+                    for item in json.load(pmf):
+                        if item.get("file_name"):
+                            prev_manifest_map[item["file_name"]] = item
+            except Exception:
+                pass
+
+        if args.skip_cached and prev_manifest_map:
+            print(f"[{reg_id}] [CACHED] Skipping IRSA query ({len(prev_manifest_map)} files in cache).")
+            downloaded_regions.append(reg_id)
+            continue
+
         print(f"[{reg_id}] Region: {reg.get('name', reg_id)}")
         print(f"  Coordinates: RA={ra:.4f}°, Dec={dec:.4f}°, Size={size_arcmin}'")
 
-        records = query_spherex_cutouts(ra, dec, size_arcmin, max_files)
+        try:
+            records = query_spherex_cutouts(
+                ra, dec, size_arcmin, max_files, timeout=args.timeout
+            )
+        except Exception as e:
+            print(f"  [ERROR] Could not query IRSA TAP for [{reg_id}]: {e}")
+            print("  Skipping this region for now and continuing...\n")
+            failed_regions.append(reg_id)
+            continue
+
+        if not records:
+            no_coverage_regions.append(reg_id)
+            print()
+            continue
+
         print(f"  Found {len(records)} overlapping exposures in '{COLLECTION_NAME}'.")
 
         # Estimate download size (clean cutouts without PSF/ZODI are ~35 KB)
@@ -485,6 +827,7 @@ def main():
                 continue
 
         manifest: List[Dict[str, Any]] = []
+        region_dl_failed = False
 
         for idx, rec in enumerate(records, 1):
             uri = rec["uri"]
@@ -497,12 +840,13 @@ def main():
             # Resume from cache if file already exists and is non-empty
             if dest_file.exists() and dest_file.stat().st_size > 1024:
                 print(f"  [{idx}/{len(records)}] Cached: {base_name} ({dest_file.stat().st_size} bytes)")
+                prev = prev_manifest_map.get(base_name, {})
                 manifest.append({
                     "file_name": base_name,
-                    "observation_time": rec.get("time_mjd"),
-                    "detector": rec.get("bandpass"),
-                    "central_wavelength_um": None,
-                    "bandwidth_um": None,
+                    "observation_time": prev.get("observation_time", str(rec.get("time_mjd", ""))),
+                    "detector": prev.get("detector", rec.get("bandpass")),
+                    "central_wavelength_um": prev.get("central_wavelength_um"),
+                    "bandwidth_um": prev.get("bandwidth_um"),
                     "size_bytes": dest_file.stat().st_size,
                     "sha256": calculate_sha256(dest_file),
                     "source_url": uri
@@ -510,14 +854,25 @@ def main():
                 continue
 
             print(f"  [{idx}/{len(records)}] Downloading cutout: {base_name}...")
-            file_meta = download_and_filter_cutout(uri, dest_file)
-            manifest.append(file_meta)
+            try:
+                file_meta = download_and_filter_cutout(uri, dest_file)
+                manifest.append(file_meta)
+            except Exception as e:
+                print(f"  [ERROR] Cutout download error for [{reg_id}]: {e}")
+                region_dl_failed = True
+                break
             time.sleep(0.5)  # Polite pause between requests to IRSA
 
-        # Write manifest.json
+        if not manifest:
+            if region_dl_failed:
+                failed_regions.append(reg_id)
+            print()
+            continue
+
+        # Write manifest.json (even if partial so next run resumes cleanly)
         with open(manifest_file, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
-        print(f"  -> Saved manifest to: {manifest_file.relative_to(REPO_ROOT)}")
+        print(f"  -> Saved manifest to: {manifest_file.relative_to(REPO_ROOT)} ({len(manifest)} exposures)")
 
         # Find and save epoch pairs
         epoch_pairs = find_epoch_pairs(manifest)
@@ -529,9 +884,25 @@ def main():
         else:
             print(f"  -> No epoch pairs separated by >= 14 days were found for this region.")
 
+        if region_dl_failed:
+            failed_regions.append(reg_id)
+        else:
+            downloaded_regions.append(reg_id)
         print()
 
-    print("[SUCCESS] SPHEREx QR2 cutouts download and manifest generation complete.")
+    if not downloaded_regions:
+        if failed_regions:
+            print(f"[FATAL] Queries/downloads failed for requested regions: {failed_regions}")
+        elif no_coverage_regions:
+            print(f"[FATAL] None of the requested regions had QR2 coverage on IRSA yet: {no_coverage_regions}")
+        sys.exit(1)
+
+    if failed_regions:
+        print(f"[WARNING] Some regions timed out or failed (re-run with --region {','.join(failed_regions)}): {', '.join(failed_regions)}")
+    if no_coverage_regions:
+        print(f"[NOTICE] Regions with 0 exposures in IRSA spherex_qr2 at this time: {', '.join(no_coverage_regions)}")
+
+    print(f"[SUCCESS] SPHEREx QR2 cutouts download complete for {len(downloaded_regions)} region(s).")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,44 @@ export interface CommonGrid {
   north_up: boolean;
 }
 
+export interface EpochPairEndpoint {
+  id?: string;
+  file?: string;
+  time_utc?: string;
+  wavelength_um?: number | null;
+}
+
+export interface EpochPair {
+  detector: number;
+  epoch_1: EpochPairEndpoint;
+  epoch_2: EpochPairEndpoint;
+  separation_days: number;
+  wavelength_diff_pct: number;
+}
+
+export interface ExportedRegionSummary {
+  id: string;
+  name: string;
+  ra_deg: number;
+  dec_deg: number;
+  size_arcmin: number;
+  target_identifiers?: string | null;
+  description?: string | null;
+  catalogue?: {
+    name?: string;
+    rows?: number;
+  };
+  counts?: {
+    exposures?: number;
+    sources?: number;
+    spectrum_points?: number;
+    null_points?: number;
+    suspect_points?: number;
+    epoch_pairs?: number;
+  };
+  path: string;
+}
+
 export interface ManifestData {
   kind: 'real' | string;
   release: string;
@@ -31,6 +69,8 @@ export interface ManifestData {
     ra_deg: number;
     dec_deg: number;
     size_arcmin: number;
+    target_identifiers?: string | null;
+    description?: string | null;
   };
   generated_utc: string;
   counts: {
@@ -41,6 +81,7 @@ export interface ManifestData {
     unplaceable_points: number;
     suspect_points?: number;
     suspect_reasons?: Record<string, number>;
+    epoch_pairs?: number;
   };
   units: {
     flux: string;
@@ -58,6 +99,7 @@ export interface ManifestData {
     rows: number;
   };
   common_grid: CommonGrid;
+  epoch_pairs?: EpochPair[];
   notes?: string[];
 }
 
@@ -121,6 +163,7 @@ export interface RealSpectrumPoint {
 }
 
 export interface RealDataset {
+  basePath: string; // '/real' or '/real/regions/<region_id>'
   manifest: ManifestData;
   exposures: RealExposure[];
   sources: RealSource[];
@@ -135,33 +178,53 @@ export interface RealLoadResult {
   errorMessage?: string;
 }
 
-// In-memory cache to prevent re-fetching 4.4MB spectra.json and metadata
-let _cachedDataset: RealDataset | null = null;
+// In-memory cache per region key to prevent re-fetching spectra.json
+const _cachedDatasets = new Map<string, RealDataset>();
 
 /**
- * Loads real SPHEREx QR2 dataset from /real/ (served from public/real/).
+ * Fetches the multi-region export index (/real/regions.json) if available.
+ */
+export async function loadAvailableRegions(): Promise<ExportedRegionSummary[]> {
+  try {
+    const res = await fetch('/real/regions.json');
+    if (!res.ok) return [];
+    const payload = await res.json();
+    if (Array.isArray(payload?.regions)) {
+      return payload.regions;
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Loads real SPHEREx QR2 dataset from /real/ (or /real/regions/<regionId>/ when specified).
  * If any file or essential key is missing, logs a warning and returns
  * failure info without throwing exceptions, enabling graceful fallback.
  */
-export async function loadRealData(): Promise<RealLoadResult> {
-  if (_cachedDataset) {
+export async function loadRealData(regionId?: string): Promise<RealLoadResult> {
+  const cacheKey = regionId || '__default__';
+  const cached = _cachedDatasets.get(cacheKey);
+  if (cached) {
     return {
       success: true,
-      data: _cachedDataset,
+      data: cached,
       missingFiles: [],
       missingKeys: [],
     };
   }
 
+  const basePath = regionId ? `/real/regions/${regionId}` : '/real';
   const missingFiles: string[] = [];
   const missingKeys: string[] = [];
 
   try {
     // 1. Fetch manifest.json
-    const manifestRes = await fetch('/real/manifest.json');
+    const manifestRes = await fetch(`${basePath}/manifest.json`);
     if (!manifestRes.ok) {
-      missingFiles.push('/real/manifest.json');
-      console.warn('[RealData] /real/manifest.json not found (HTTP ' + manifestRes.status + ')');
+      missingFiles.push(`${basePath}/manifest.json`);
+      console.warn(`[RealData] ${basePath}/manifest.json not found (HTTP ${manifestRes.status})`);
       return {
         success: false,
         data: null,
@@ -176,9 +239,9 @@ export async function loadRealData(): Promise<RealLoadResult> {
     if (!manifest.counts) missingKeys.push('manifest.counts');
 
     // 2. Fetch exposures.json
-    const exposuresRes = await fetch('/real/exposures.json');
+    const exposuresRes = await fetch(`${basePath}/exposures.json`);
     if (!exposuresRes.ok) {
-      missingFiles.push('/real/exposures.json');
+      missingFiles.push(`${basePath}/exposures.json`);
     }
     const exposuresRaw = exposuresRes.ok ? await exposuresRes.json() : null;
     const exposures: RealExposure[] = Array.isArray(exposuresRaw)
@@ -189,9 +252,9 @@ export async function loadRealData(): Promise<RealLoadResult> {
     if (!exposures.length) missingKeys.push('exposures (empty or invalid)');
 
     // 3. Fetch sources.json (accepts either array or {"sources": [...]})
-    const sourcesRes = await fetch('/real/sources.json');
+    const sourcesRes = await fetch(`${basePath}/sources.json`);
     if (!sourcesRes.ok) {
-      missingFiles.push('/real/sources.json');
+      missingFiles.push(`${basePath}/sources.json`);
     }
     const sourcesRaw = sourcesRes.ok ? await sourcesRes.json() : null;
     const sources: RealSource[] = Array.isArray(sourcesRaw)
@@ -201,10 +264,10 @@ export async function loadRealData(): Promise<RealLoadResult> {
       : [];
     if (!sources.length) missingKeys.push('sources (empty or invalid)');
 
-    // 4. Fetch spectra.json (~4.4 MB object keyed by source ID)
-    const spectraRes = await fetch('/real/spectra.json');
+    // 4. Fetch spectra.json (object keyed by source ID)
+    const spectraRes = await fetch(`${basePath}/spectra.json`);
     if (!spectraRes.ok) {
-      missingFiles.push('/real/spectra.json');
+      missingFiles.push(`${basePath}/spectra.json`);
     }
     const spectra: Record<string, RealSpectrumPoint[]> = spectraRes.ok ? await spectraRes.json() : {};
     if (!spectra || typeof spectra !== 'object' || Object.keys(spectra).length === 0) {
@@ -224,13 +287,14 @@ export async function loadRealData(): Promise<RealLoadResult> {
     }
 
     const dataset: RealDataset = {
+      basePath,
       manifest,
       exposures,
       sources,
       spectra,
     };
 
-    _cachedDataset = dataset;
+    _cachedDatasets.set(cacheKey, dataset);
     return {
       success: true,
       data: dataset,

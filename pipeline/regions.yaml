@@ -50,3 +50,57 @@ regions:
     max_files: 120
     catalogue: "allwise"
     description: "Standard extragalactic benchmark field with low interstellar extinction, excellent for galaxy SED studies."
+
+  - id: "barnards-star"
+    name: "Barnard's Star (GJ 699 / HIP 87937)"
+    ra_deg: 269.452075
+    dec_deg: 4.693364
+    size_arcmin: 15.0
+    max_files: 120
+    catalogue: "gaia_dr3"
+    gaia_source_ids: "4472832130942575872"
+    target_identifiers: "Gaia DR3 4472832130942575872, GJ 699, HIP 87937"
+    description: "Nearest single M-dwarf star (1.83 pc) with the largest known proper motion (~10.39 arcsec/yr); Gaia DR3 4472832130942575872."
+
+  - id: "epsilon-indi"
+    name: "Epsilon Indi System (ε Indi A & Ba)"
+    ra_deg: 330.840208
+    dec_deg: -56.785972
+    size_arcmin: 18.0
+    max_files: 120
+    catalogue: "gaia_dr3"
+    gaia_source_ids: "6412595290592307840, 6412596012146801152"
+    target_identifiers: "Gaia DR3 6412595290592307840 (ε Indi A), Gaia DR3 6412596012146801152 (ε Indi Ba)"
+    description: "Nearby K4.5V star ε Indi A and its wide binary T-dwarf companion ε Indi Ba (~6.7 arcmin separation); 18' field covers both components."
+
+  - id: "wise-0855-0714"
+    name: "WISE 0855-0714 (WISE J085510.83-071442.5)"
+    ra_deg: 133.795129
+    dec_deg: -7.245147
+    size_arcmin: 15.0
+    max_files: 120
+    catalogue: "allwise"
+    target_identifiers: "WISE J085510.83-071442.5"
+    description: "Coldest known Y-type brown dwarf (~250 K at 2.28 pc); optically invisible in Gaia, matched using infrared AllWISE."
+
+  - id: "rw-aurigae"
+    name: "RW Aurigae Binary (Components A & B)"
+    ra_deg: 76.956083
+    dec_deg: 30.401325
+    size_arcmin: 15.0
+    max_files: 120
+    catalogue: "gaia_dr3"
+    gaia_source_ids: "156430822114424576, 156430817820015232"
+    target_identifiers: "Gaia DR3 156430822114424576 (RW Aur A), Gaia DR3 156430817820015232 (RW Aur B)"
+    description: "Classical T Tauri pre-main-sequence binary system in Taurus-Auriga with circumstellar dust and variable infrared emission."
+
+  - id: "r-draconis"
+    name: "R Draconis (V* R Dra)"
+    ra_deg: 248.167625
+    dec_deg: 66.754972
+    size_arcmin: 15.0
+    max_files: 120
+    catalogue: "gaia_dr3"
+    target_identifiers: "V* R Dra (J2000 16h 32m 40.23s +66° 45' 17.9\")"
+    description: "Long-period Mira-type pulsating asymptotic giant branch star near the North Ecliptic Pole deep-survey zone."
+

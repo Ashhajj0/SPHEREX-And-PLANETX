@@ -23,6 +23,19 @@ export const MethodPage: React.FC<MethodPageProps> = ({
   const solidAngleKind = realDataset?.manifest?.solid_angle_kind || 'nominal solid angle';
   const badFlagBits = realDataset?.manifest?.bad_flag_bits || [0, 1, 2, 3, 15, 26, 27];
   const badFlagBitsStr = badFlagBits.join(', ');
+  const catalogueName = realDataset?.manifest?.catalogue?.name || 'Gaia DR3';
+  const exposures = realDataset?.exposures || [];
+  const exposureCount = realDataset?.manifest?.counts?.exposures ?? (exposures.length || 120);
+  const epochPairsCount = realDataset?.manifest?.epoch_pairs?.length ?? realDataset?.manifest?.counts?.epoch_pairs ?? 0;
+
+  const dates = exposures
+    .map((e) => (e.time_utc ? e.time_utc.split('T')[0] : ''))
+    .filter(Boolean)
+    .sort();
+  const dateRangeStr =
+    dates.length >= 2
+      ? `${dates[0]} and ${dates[dates.length - 1]}`
+      : dates[0] || '2025-04-24 and 2025-04-27';
 
   // Compute measured exposure counts and wavelength ranges per detector from exposures.json
   const detectorData = [
@@ -70,8 +83,6 @@ export const MethodPage: React.FC<MethodPageProps> = ({
     },
   ];
 
-  const exposures = realDataset?.exposures || [];
-
   return (
     <div className="w-full pt-14 pb-12 flex-1 flex flex-col bg-surface">
       {/* Banner */}
@@ -91,7 +102,7 @@ export const MethodPage: React.FC<MethodPageProps> = ({
             Scientific Pipeline & Data Reduction Method
           </h1>
           <p className="font-body-md text-on-surface-variant max-w-3xl font-light">
-            How real SPHEREx QR2 cutouts are calibrated, detected, photometered, and cross-matched against Gaia DR3.
+            How real SPHEREx QR2 cutouts are calibrated, detected, photometered, and cross-matched against Gaia DR3 or AllWISE.
           </p>
         </div>
       </div>
@@ -169,14 +180,14 @@ export const MethodPage: React.FC<MethodPageProps> = ({
             <div className="p-4 rounded-xl bg-surface-container-lowest border border-surface-container-high flex flex-col gap-2 shadow-md">
               <div className="flex items-center justify-between border-b border-surface-container-high/50 pb-2">
                 <span className="font-bold text-primary font-headline-sm text-sm">
-                  5. Gaia DR3 Cross-Match
+                  5. {catalogueName} Cross-Match
                 </span>
                 <span className="font-data-mono-sm text-[11px] text-secondary">
                   Radius: 6.15" (1 px)
                 </span>
               </div>
               <p className="text-on-surface-variant leading-relaxed font-light">
-                Gaia DR3 source positions are propagated to the 2025 observation epoch using Gaia proper motion vectors (pmra, pmdec) before matching within a 6.15 arcsecond (1 pixel) search radius. For each matched star, links to an ADS search for the Gaia identifier are provided.
+                Gaia DR3 source positions are propagated to the observation epoch using Gaia proper motion vectors (pmra, pmdec) before matching within a 6.15 arcsecond (1 pixel) search radius; infrared-only targets such as WISE 0855-0714 use AllWISE coordinates. For each matched star, links to an ADS search for the catalogue identifier are provided.
               </p>
             </div>
 
@@ -215,14 +226,18 @@ export const MethodPage: React.FC<MethodPageProps> = ({
             <div className="p-3 rounded bg-surface-container-low border border-surface-container-high flex flex-col gap-1">
               <span className="font-semibold text-on-surface">2. Single-Exposure Detection</span>
               <p className="font-light">
-                Sources were detected exclusively on exposure {refExposureId} (3.049 µm). Objects that are faint at 3.05 µm but bright at other wavelengths may not appear in the catalog.
+                Sources were detected exclusively on exposure {refExposureId} ({refWavelength.toFixed(3)} µm). Objects that are faint at {refWavelength.toFixed(2)} µm but bright at other wavelengths may not appear in the catalog.
               </p>
             </div>
 
             <div className="p-3 rounded bg-surface-container-low border border-surface-container-high flex flex-col gap-1">
-              <span className="font-semibold text-on-surface">3. No Epoch Pairs</span>
+              <span className="font-semibold text-on-surface">
+                3. {epochPairsCount > 0 ? `${epochPairsCount} Epoch Pairs Found` : 'No Epoch Pairs'}
+              </span>
               <p className="font-light">
-                All 120 exposures were captured between 2025-04-24 and 2025-04-27. Multi-epoch moving-object orbital tracking is not possible with this single-epoch dataset.
+                {epochPairsCount > 0
+                  ? `${exposureCount} exposures spanning ${dateRangeStr} yielded ${epochPairsCount} multi-epoch pair(s) meeting the 14-day baseline and 2% wavelength criteria.`
+                  : `All ${exposureCount} exposures in this region were captured between ${dateRangeStr}. Multi-epoch orbital screening requires pairs at least 14 days apart.`}
               </p>
             </div>
 
@@ -242,7 +257,7 @@ export const MethodPage: React.FC<MethodPageProps> = ({
               2. The 6 Linear Variable Filter (LVF) Detectors
             </h2>
             <p className="font-body-md text-xs text-on-surface-variant">
-              The mission defines 17 nominal channels per detector (102 in total). Our dataset has 120 exposures, each measuring one wavelength for a given source.
+              The mission defines 17 nominal channels per detector (102 in total). The active region has {exposureCount} exposures, each measuring one wavelength for a given source.
             </p>
           </div>
 

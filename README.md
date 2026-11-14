@@ -60,13 +60,13 @@ python pipeline/fetch_spherex.py
 python pipeline\fetch_spherex.py
 ```
 *What you will see:*
-- Queries IRSA TAP for collection `spherex_qr2` covering all 3 target regions.
+- Queries IRSA TAP for collection `spherex_qr2` covering all 8 configured targets (`north-ecliptic-pole`, `south-ecliptic-pole`, `cosmos`, `barnards-star`, `epsilon-indi`, `wise-0855-0714`, `rw-aurigae`, `r-draconis`). If any sky position has no QR2 cutouts yet, it prints `[NO QR2 COVERAGE]` and moves on to the rest cleanly.
 - Shows planned cutout count and prompts `Proceed with downloading cutouts? [y/N]:`.
 - Downloads spatial cutouts, drops the massive PSF cube and ZODI to save disk space, and keeps `IMAGE`, `FLAGS`, `VARIANCE`, and `WCS-WAVE`.
 - Computes central wavelength at the field center from `WCS-WAVE` and writes `cache/spherex/<region_id>/manifest.json`.
 - Identifies exposure pairs observed $\ge 14$ days apart with matching detector and central wavelength within 2%, saving them to `cache/spherex/<region_id>/epoch_pairs.json`.
 
-*(Tip: To auto-confirm without prompting, use `python pipeline/fetch_spherex.py --yes`)*
+*(Tips: Pass `--yes` to skip the prompt, or pass `--region barnards-star,epsilon-indi` to download only specific targets.)*
 
 ---
 
@@ -79,14 +79,26 @@ python pipeline/fetch_catalogue.py
 python pipeline\fetch_catalogue.py
 ```
 *What you will see:*
-- For `north-ecliptic-pole` and `south-ecliptic-pole`: Queries the official **ESA Gaia TAP** service (`gaiadr3.gaia_source`) including an extra 2-arcminute safety margin.
-- For `cosmos`: Queries **IRSA TAP_SCHEMA.columns** to verify the real column names of `allwise_p3as_psd` before querying (`designation`, `ra`, `dec`, `w1mpro`, `w2mpro`).
+- For `gaia_dr3` targets (`north-ecliptic-pole`, `south-ecliptic-pole`, `barnards-star`, `epsilon-indi`, `rw-aurigae`, `r-draconis`): Queries **ESA Gaia TAP** (`gaiadr3.gaia_source`) with an extra 2-arcminute safety margin, plus explicit inclusion of the requested `gaia_source_ids` (including proper motion `pmra`, `pmdec`).
+- For `allwise` targets (`cosmos`, `wise-0855-0714`): Queries **IRSA TAP_SCHEMA.columns** to verify the real column names of `allwise_p3as_psd` before querying (`designation`, `ra`, `dec`, `w1mpro`, `w2mpro`).
 - Prints the real source count and saves clean CSV files with full ADQL provenance to `cache/catalogue/<region_id>/`.
 - Never uses or creates synthetic rows.
 
+*(Tip: You can also filter by target with `--region <id>`.)*
+
 ---
 
-#### 3. Inspect Real FITS Cutouts & Generate Technical Report
+#### 3. Export All Regions for the Website
+```bash
+python -m backend.compute.export_region --all
+```
+*What you will see:*
+- Extracts calibrated source fluxes and quality metrics (`ok` / `suspect` / `null`) for every downloaded target in `cache/spherex/`.
+- Exports PNG cutouts and JSON files to `web/public/real/regions/<region_id>/`, updates `web/public/real/regions.json`, and mirrors the primary region into `web/public/real/` for backwards compatibility.
+
+---
+
+#### 4. Inspect Real FITS Cutouts & Generate Technical Report
 ```bash
 python pipeline/inspect_fits.py
 ```
@@ -170,34 +182,22 @@ python pipeline\verify_data.py
 
 ## Target Regions (`pipeline/regions.yaml`)
 
-You can edit `pipeline/regions.yaml` in any text editor to adjust coordinates, field sizes, or file limits:
+You can edit `pipeline/regions.yaml` in any text editor to adjust coordinates, field sizes, or file limits. Configured targets currently include:
+- `north-ecliptic-pole` — North Ecliptic Pole Deep Field (`gaia_dr3`)
+- `south-ecliptic-pole` — South Ecliptic Pole Deep Field (`gaia_dr3`)
+- `cosmos` — COSMOS Extragalactic Field (`allwise`)
+- `barnards-star` — Barnard's Star (`GJ 699`, `HIP 87937`, `Gaia DR3 4472832130942575872`)
+- `epsilon-indi` — Epsilon Indi System (`Gaia DR3 6412595290592307840` & `6412596012146801152`)
+- `wise-0855-0714` — WISE 0855-0714 (`WISE J085510.83-071442.5`, `allwise`)
+- `rw-aurigae` — RW Aurigae Binary (`Gaia DR3 156430822114424576` & `156430817820015232`)
+- `r-draconis` — R Draconis (`V* R Dra`, `gaia_dr3`)
 
-```yaml
-regions:
-  - id: "north-ecliptic-pole"
-    name: "North Ecliptic Pole Deep Field (NEP)"
-    ra_deg: 270.3317
-    dec_deg: 66.5614
-    size_arcmin: 15.0
-    max_files: 8
-    catalogue: "gaia_dr3"
-
-  - id: "south-ecliptic-pole"
-    name: "South Ecliptic Pole Deep Field (SEP)"
-    ra_deg: 90.0000
-    dec_deg: -66.5614
-    size_arcmin: 15.0
-    max_files: 8
-    catalogue: "gaia_dr3"
-
-  - id: "cosmos"
-    name: "COSMOS Extragalactic Field"
-    ra_deg: 150.1192
-    dec_deg: 2.2058
-    size_arcmin: 12.0
-    max_files: 6
-    catalogue: "allwise"
+Start the website after running `export_region --all`:
+```bash
+npm install
+npm run dev
 ```
+Then open `http://localhost:3000` in your browser.
 
 ---
 

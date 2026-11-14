@@ -24,8 +24,9 @@ Summary Metrics Printed:
 import sys
 import json
 import math
+import argparse
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Optional, Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -36,12 +37,13 @@ CANDIDATE_DIRS = [
 ]
 
 
-def find_export_dir() -> Path:
-    """Finds the active export directory."""
+def find_export_dir(region_id: Optional[str] = None) -> Path:
+    """Finds the active export directory (or specific region directory if requested)."""
     for d in CANDIDATE_DIRS:
-        if d.exists() and (d / "manifest.json").exists():
-            return d
-    return CANDIDATE_DIRS[0]
+        target = (d / "regions" / region_id) if region_id else d
+        if target.exists() and (target / "manifest.json").exists():
+            return target
+    return (CANDIDATE_DIRS[0] / "regions" / region_id) if region_id else CANDIDATE_DIRS[0]
 
 
 def check_no_nans(data: Any, path_str: str = "") -> List[str]:
@@ -84,12 +86,16 @@ def print_12_points(source_id: str, points: List[Dict[str, Any]]):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Validate exported SPHEREx QR2 dataset.")
+    parser.add_argument("--region", type=str, default=None, help="Optional region ID under regions/ to validate.")
+    args = parser.parse_args()
+
     print("=================================================================")
     print(" SPHEREx Export Dataset Validator")
     print(" Enforcing Strict Completeness, Schema, and Scientific Integrity")
     print("=================================================================\n")
 
-    export_dir = find_export_dir()
+    export_dir = find_export_dir(args.region)
     print(f"Inspecting export directory: {export_dir.relative_to(REPO_ROOT)}/\n")
 
     failures = []

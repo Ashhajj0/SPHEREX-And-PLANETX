@@ -16,10 +16,12 @@ Key features:
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 import csv
 import math
+import urllib.parse
 
 try:
     import numpy as np
@@ -43,13 +45,14 @@ class CrossmatchResult:
     source_id: str                          # SPHEREx source ID (e.g. 'SPX-NEP-001')
     ra_deg: float                           # SPHEREx RA in degrees
     dec_deg: float                          # SPHEREx Dec in degrees
-    gaia_id: Optional[str]                  # Gaia DR3 source_id, or None if no match
+    gaia_id: Optional[str]                  # Matched catalogue identifier (Gaia DR3 source_id or AllWISE designation), or None
     separation_arcsec: Optional[float]      # Angular distance in arcseconds to closest match, or None
     candidates_in_radius: int               # Number of catalogue stars within search radius
-    ads_url: Optional[str]                  # NASA ADS query URL for Gaia identifier, or None
+    ads_url: Optional[str]                  # NASA ADS query URL for matched identifier, or None
     phot_g_mean_mag: Optional[float]        # Gaia G-band magnitude, or None
     phot_bp_mean_mag: Optional[float]       # Gaia BP-band magnitude, or None
     phot_rp_mean_mag: Optional[float]       # Gaia RP-band magnitude, or None
+    catalogue_name: str = "Gaia DR3"        # Reference catalogue used ("Gaia DR3" or "AllWISE")
 
     def to_dict(self) -> Dict[str, Any]:
         """Returns a JSON-safe dictionary representation with NaNs/Infinities converted to None."""
@@ -58,6 +61,7 @@ class CrossmatchResult:
             "ra_deg": sanitize_scalar(self.ra_deg, 6),
             "dec_deg": sanitize_scalar(self.dec_deg, 6),
             "gaia_id": self.gaia_id,
+            "catalogue_name": self.catalogue_name,
             "separation_arcsec": sanitize_scalar(self.separation_arcsec, 2),
             "candidates_in_radius": self.candidates_in_radius,
             "ads_url": self.ads_url,
@@ -65,6 +69,26 @@ class CrossmatchResult:
             "phot_bp_mean_mag": sanitize_scalar(self.phot_bp_mean_mag, 3),
             "phot_rp_mean_mag": sanitize_scalar(self.phot_rp_mean_mag, 3)
         }
+
+
+def parse_obs_decimal_year(obs_time_iso: Optional[str]) -> Optional[float]:
+    """Converts an ISO observation timestamp into a fractional Julian/calendar year."""
+    if not obs_time_iso:
+        return None
+    clean = str(obs_time_iso).strip().split("+")[0].rstrip("Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(clean, fmt)
+            year_start = datetime(dt.year, 1, 1)
+            next_year_start = datetime(dt.year + 1, 1, 1)
+            frac = (dt - year_start).total_seconds() / (next_year_start - year_start).total_seconds()
+            return dt.year + frac
+        except ValueError:
+            continue
+    try:
+        return float(clean[:4])
+    except Exception:
+        return None
 
 
 def load_catalogue_rows(catalogue_path: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -143,6 +167,10 @@ def crossmatch_sources(
     if id_col is None and fieldnames:
         id_col = fieldnames[0]
 
+    # Determine whether this is AllWISE or Gaia DR3 from columns and filename
+    is_allwise = (id_col == "designation") or ("allwise" in catalogue_path.name.lower())
+    cat_label = "AllWISE" if is_allwise else "Gaia DR3"
+
     # Look for coordinates
     ra_col = next((c for c in fieldnames if c.lower() in ("ra", "raj2000")), "ra")
     dec_col = next((c for c in fieldnames if c.lower() in ("dec", "decj2000")), "dec")
@@ -165,13 +193,9 @@ def crossmatch_sources(
     # Calculate time delta for proper motion if observation time is available
     # Gaia DR3 reference epoch is J2016.0
     delta_years = 0.0
-    if obs_time_iso:
-        try:
-            year_val = float(obs_time_iso[:4])
-            # Rough fractional year approximation
-            delta_years = year_val - 2016.0
-        except Exception:
-            delta_years = 0.0
+    obs_year = parse_obs_decimal_year(obs_time_iso)
+    if obs_year is not None:
+        delta_years = obs_year - 2016.0
 
     for idx, row in enumerate(cat_rows):
         try:
@@ -248,7 +272,10 @@ def crossmatch_sources(
 
             if sep <= max_radius_arcsec:
                 raw_id = str(cat_entry.get(id_col, "unknown")).strip()
-                ads_url = f"https://ui.adsabs.harvard.edu/search/q=gaia%20dr3%20{raw_id}"
+                if is_allwise:
+                    ads_url = f"https://ui.adsabs.harvard.edu/search/q={urllib.parse.quote(raw_id)}"
+                else:
+                    ads_url = f"https://ui.adsabs.harvard.edu/search/q=gaia%20dr3%20{urllib.parse.quote(raw_id)}"
 
                 def safe_float(val):
                     try:
@@ -270,7 +297,8 @@ def crossmatch_sources(
                     ads_url=ads_url,
                     phot_g_mean_mag=g_mag,
                     phot_bp_mean_mag=bp_mag,
-                    phot_rp_mean_mag=rp_mag
+                    phot_rp_mean_mag=rp_mag,
+                    catalogue_name=cat_label
                 ))
             else:
                 # No catalogue source within match radius
@@ -284,7 +312,8 @@ def crossmatch_sources(
                     ads_url=None,
                     phot_g_mean_mag=None,
                     phot_bp_mean_mag=None,
-                    phot_rp_mean_mag=None
+                    phot_rp_mean_mag=None,
+                    catalogue_name=cat_label
                 ))
         return results
 
@@ -319,7 +348,10 @@ def crossmatch_sources(
 
         if best_entry is not None:
             raw_id = str(best_entry.get(id_col, "unknown")).strip()
-            ads_url = f"https://ui.adsabs.harvard.edu/search/q=gaia%20dr3%20{raw_id}"
+            if is_allwise:
+                ads_url = f"https://ui.adsabs.harvard.edu/search/q={urllib.parse.quote(raw_id)}"
+            else:
+                ads_url = f"https://ui.adsabs.harvard.edu/search/q=gaia%20dr3%20{urllib.parse.quote(raw_id)}"
             results.append(CrossmatchResult(
                 source_id=s.id,
                 ra_deg=s.ra_deg,
@@ -330,7 +362,8 @@ def crossmatch_sources(
                 ads_url=ads_url,
                 phot_g_mean_mag=None,
                 phot_bp_mean_mag=None,
-                phot_rp_mean_mag=None
+                phot_rp_mean_mag=None,
+                catalogue_name=cat_label
             ))
         else:
             results.append(CrossmatchResult(
@@ -343,7 +376,8 @@ def crossmatch_sources(
                 ads_url=None,
                 phot_g_mean_mag=None,
                 phot_bp_mean_mag=None,
-                phot_rp_mean_mag=None
+                phot_rp_mean_mag=None,
+                catalogue_name=cat_label
             ))
 
     return results
