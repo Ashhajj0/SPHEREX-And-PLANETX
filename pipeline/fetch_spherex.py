@@ -97,6 +97,23 @@ def calculate_sha256(file_path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Query IRSA TAP for Real SPHEREx QR2 Cutouts
 # ---------------------------------------------------------------------------
+def _build_obscore_adql(
+    ra_deg: float,
+    dec_deg: float,
+    max_files: int,
+) -> str:
+    """Builds a lightweight ADQL spatial query against IRSA spherex.obscore (no JOIN)."""
+    return f"""
+    SELECT TOP {max_files}
+        access_url,
+        t_min,
+        obs_id,
+        obs_collection
+    FROM spherex.obscore
+    WHERE CONTAINS(POINT('ICRS', {ra_deg:.6f}, {dec_deg:.6f}), s_region) = 1
+    """.strip()
+
+
 def _build_spherex_adql(
     ra_deg: float,
     dec_deg: float,
@@ -234,7 +251,7 @@ def _execute_async_tap(adql_query: str, timeout: int = 180) -> List[Dict[str, An
 
 
 def _parse_tap_csv(text: str) -> List[Dict[str, Any]]:
-    """Parses CSV text returned by IRSA TAP into cutout query records."""
+    """Parses CSV text returned by IRSA TAP (artifact/plane OR spherex.obscore) into records."""
     import csv
     import io
 
@@ -245,14 +262,20 @@ def _parse_tap_csv(text: str) -> List[Dict[str, Any]]:
     reader = csv.DictReader(io.StringIO(text))
     records: List[Dict[str, Any]] = []
     for row in reader:
-        uri = row.get("uri", "")
-        if "spherex" in uri:
-            records.append({
-                "uri": uri,
-                "time_mjd": float(row.get("time_bounds_lower") or 0.0),
-                "bandpass": row.get("energy_bandpassname", ""),
-                "obsid": row.get("obsid", ""),
-            })
+        uri = (row.get("uri") or row.get("access_url") or "").strip()
+        if not uri or "spherex" not in uri:
+            continue
+        raw_t = row.get("time_bounds_lower") or row.get("t_min") or 0.0
+        try:
+            t_mjd = float(raw_t)
+        except Exception:
+            t_mjd = 0.0
+        records.append({
+            "uri": uri,
+            "time_mjd": t_mjd,
+            "bandpass": row.get("energy_bandpassname") or row.get("obs_collection") or "",
+            "obsid": row.get("obsid") or row.get("obs_id") or "",
+        })
     return records
 
 
@@ -398,46 +421,61 @@ def query_spherex_cutouts(
     Queries IRSA for SPHEREx observation cutouts covering the given coordinates.
     Order of attempts for speed & reliability:
     1. Fast spatially-indexed IRSA SIAv2 (astroquery Irsa.query_sia)
-    2. Fast unordered IRSA Sync TAP (no full-table ORDER BY sort)
-    3. IRSA Asynchronous TAP (/TAP/async) fallback
+    2. Fast single-table IRSA Sync TAP on spherex.obscore (avoids polygon JOIN)
+    3. Fast unordered IRSA Sync TAP on spherex.artifact JOIN spherex.plane
+    4. IRSA Asynchronous TAP (/TAP/async) fallback (obscore then artifact/plane)
     """
     # 1. Try fast SIAv2 first (avoids TAP polygon join bottlenecks)
     sia_records = _query_via_sia(ra_deg, dec_deg, size_arcmin, max_files)
     if sia_records:
         return sia_records
 
+    obscore_adql = _build_obscore_adql(ra_deg, dec_deg, max_files)
     unordered_adql = _build_spherex_adql(ra_deg, dec_deg, size_arcmin, max_files, ordered=False)
     ordered_adql = _build_spherex_adql(ra_deg, dec_deg, size_arcmin, max_files, ordered=True)
 
-    print(f"  Sending fast ADQL query to Caltech/IPAC IRSA TAP (timeout={timeout}s)...")
     last_err: Optional[Exception] = None
     records: Optional[List[Dict[str, Any]]] = None
 
-    # 2. Try fast unordered Sync TAP (2 attempts)
-    for attempt in range(1, 3):
-        try:
-            text = _execute_sync_tap(unordered_adql, timeout=timeout)
-            records = _parse_tap_csv(text)
-            records.sort(key=lambda r: r.get("time_mjd", 0.0))
-            break
-        except Exception as e:
-            last_err = e
-            print(f"    [Sync Retry {attempt}/2] IRSA TAP query warning: {_short_err(e)}")
-            time.sleep(2.0 * attempt)
+    # 2. Try single-table spherex.obscore Sync TAP (no JOIN)
+    print(f"  Sending spherex.obscore ADQL query to IRSA TAP (timeout={timeout}s)...")
+    try:
+        text = _execute_sync_tap(obscore_adql, timeout=timeout)
+        records = _parse_tap_csv(text)
+        records.sort(key=lambda r: r.get("time_mjd", 0.0))
+    except Exception as e:
+        last_err = e
+        print(f"    [obscore Sync warning] {_short_err(e)}")
 
-    # 3. Fall back to IRSA Async TAP (/TAP/async)
+    # 3. Try fast unordered Sync TAP on artifact JOIN plane (2 attempts)
+    if records is None:
+        print(f"  Sending artifact/plane ADQL query to IRSA TAP (timeout={timeout}s)...")
+        for attempt in range(1, 3):
+            try:
+                text = _execute_sync_tap(unordered_adql, timeout=timeout)
+                records = _parse_tap_csv(text)
+                records.sort(key=lambda r: r.get("time_mjd", 0.0))
+                break
+            except Exception as e:
+                last_err = e
+                print(f"    [Sync Retry {attempt}/2] IRSA TAP query warning: {_short_err(e)}")
+                time.sleep(2.0 * attempt)
+
+    # 4. Fall back to IRSA Async TAP (/TAP/async)
     if records is None:
         print("  Sync TAP timed out/failed; switching to IRSA Asynchronous TAP (/TAP/async)...")
-        try:
-            records = _execute_async_tap(unordered_adql, timeout=max(180, timeout * 2))
-            records.sort(key=lambda r: r.get("time_mjd", 0.0))
-        except Exception as e:
-            last_err = e
-            print(f"    [Async Retry] Unordered query failed ({_short_err(e)}); retrying ordered TAP...")
+        for label, q in [
+            ("obscore", obscore_adql),
+            ("unordered artifact/plane", unordered_adql),
+            ("ordered artifact/plane", ordered_adql),
+        ]:
             try:
-                records = _execute_async_tap(ordered_adql, timeout=max(180, timeout * 2))
-            except Exception as e2:
-                last_err = e2
+                records = _execute_async_tap(q, timeout=max(180, timeout * 2))
+                records.sort(key=lambda r: r.get("time_mjd", 0.0))
+                break
+            except Exception as e:
+                last_err = e
+                print(f"    [Async '{label}'] failed ({_short_err(e)})")
 
     if records is None:
         raise RuntimeError(f"IRSA queries failed (SIAv2 + Sync TAP + Async TAP): {_short_err(last_err) if last_err else 'Unknown error'}")
@@ -453,38 +491,207 @@ def query_spherex_cutouts(
 # ---------------------------------------------------------------------------
 # Filter and Save FITS Cutout (Keep IMAGE, FLAGS, VARIANCE, WCS-WAVE)
 # ---------------------------------------------------------------------------
-def download_and_filter_cutout(cutout_url: str, dest_path: Path, max_retries: int = 3) -> Dict[str, Any]:
+def _resolve_datalink_candidates(
+    datalink_url: str,
+    ra_deg: float,
+    dec_deg: float,
+    size_arcmin: float,
+) -> List[Tuple[str, bool]]:
     """
-    Downloads the cutout MEF, drops PSF and ZODI to save space, and extracts
-    observation time, detector, and central wavelength.
+    Resolves an IRSA DataLink VOTable URL into ordered download candidates:
+    [(url, needs_local_cutout), ...]
+    Prefer fast IRSA server-side cutout first, then direct NASA AWS S3 FITS + local Cutout2D.
     """
-    # 1. Download raw cutout with retries
+    import xml.etree.ElementTree as ET
+
+    req = urllib.request.Request(
+        datalink_url,
+        headers={"User-Agent": "SPHEREx-Data-Pipeline/2.0 (IRSA-QR2)"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        xml_bytes = resp.read()
+
+    root = ET.fromstring(xml_bytes)
+    ns = {"v": "http://www.ivoa.net/xml/VOTable/v1.3"}
+    size_deg = size_arcmin / 60.0
+
+    candidates: List[Tuple[str, bool]] = []
+    s3_urls: List[Tuple[str, bool]] = []
+
+    for tr in root.findall(".//v:TABLEDATA/v:TR", ns):
+        tds = [td.text or "" for td in tr.findall("v:TD", ns)]
+        if len(tds) < 5:
+            continue
+        semantics = tds[4].strip()
+        access_url = tds[1].strip()
+        service_def = tds[2].strip()
+        ibe_path = tds[12].strip() if len(tds) > 12 else ""
+
+        if semantics == "#cutout" and service_def == "ibe-cutout" and ibe_path:
+            q_url = (
+                "https://irsa.ipac.caltech.edu/ibe/cutout?"
+                + urllib.parse.urlencode({
+                    "ra": f"{ra_deg:.6f}",
+                    "dec": f"{dec_deg:.6f}",
+                    "size": f"{size_deg:.6f}",
+                    "path": ibe_path,
+                })
+            )
+            candidates.append((q_url, False))
+        elif semantics == "#this" and access_url:
+            candidates.append((
+                f"{access_url}?center={ra_deg:.6f},{dec_deg:.6f}d&size={size_deg:.6f}d",
+                False,
+            ))
+            # Check AWS S3 location metadata in last TD
+            meta_json = tds[-1].strip() if tds else ""
+            if meta_json.startswith("{"):
+                try:
+                    meta = json.loads(meta_json)
+                    aws = meta.get("aws", {})
+                    bucket = aws.get("bucket_name")
+                    key = aws.get("key")
+                    if bucket and key:
+                        s3_urls.append((f"https://{bucket}.s3.amazonaws.com/{key}", True))
+                except Exception:
+                    pass
+
+    candidates.extend(s3_urls)
+    return candidates
+
+
+def _slice_local_cutout_hdulist(
+    hdulist: Any,
+    ra_deg: float,
+    dec_deg: float,
+    size_arcmin: float,
+) -> Any:
+    """
+    Slices a full SPHEREx Level-2 MEF (from AWS S3) down to a centered sky cutout
+    matching IRSA's cutout layout (IMAGE, FLAGS, VARIANCE, WCS-WAVE).
+    """
+    from astropy.io import fits
+    from astropy.nddata import Cutout2D
+    from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    img_hdr = hdulist["IMAGE"].header
+    spatial_wcs = WCS(img_hdr)
+    center = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+    box_size = (size_arcmin * u.arcmin, size_arcmin * u.arcmin)
+
+    cut_img = Cutout2D(
+        hdulist["IMAGE"].data,
+        position=center,
+        size=box_size,
+        wcs=spatial_wcs,
+        mode="partial",
+        fill_value=float("nan"),
+    )
+    xmin, ymin = cut_img.xmin_original, cut_img.ymin_original
+
+    new_img_hdr = img_hdr.copy()
+    new_img_hdr.update(cut_img.wcs.to_header(relax=True))
+    # Shift spectral WCS ('W') reference pixels to match the sliced image origin
+    if "CRPIX1W" in new_img_hdr:
+        new_img_hdr["CRPIX1W"] = float(new_img_hdr["CRPIX1W"]) - float(xmin)
+    if "CRPIX2W" in new_img_hdr:
+        new_img_hdr["CRPIX2W"] = float(new_img_hdr["CRPIX2W"]) - float(ymin)
+
+    clean_hdus = [hdulist[0].copy()]
+    clean_hdus[0].header.add_comment("Cutout sliced locally from NASA AWS S3 (nasa-irsa-spherex)")
+    clean_hdus[0].header["SPHEREX_RELEASE"] = ("QR2", "NASA SPHEREx Quick Release 2")
+    clean_hdus[0].header["ARCHIVE_DOI"] = ("10.26131/IRSA652", "IRSA Archive DOI")
+
+    clean_hdus.append(fits.ImageHDU(data=cut_img.data, header=new_img_hdr, name="IMAGE"))
+
+    for ext_name, fill_val in [("FLAGS", 1), ("VARIANCE", float("nan"))]:
+        if ext_name in hdulist:
+            ext_cut = Cutout2D(
+                hdulist[ext_name].data,
+                position=center,
+                size=box_size,
+                wcs=spatial_wcs,
+                mode="partial",
+                fill_value=fill_val,
+            )
+            ext_hdr = hdulist[ext_name].header.copy()
+            ext_hdr.update(ext_cut.wcs.to_header(relax=True))
+            clean_hdus.append(fits.ImageHDU(data=ext_cut.data, header=ext_hdr, name=ext_name))
+
+    if "WCS-WAVE" in hdulist:
+        clean_hdus.append(hdulist["WCS-WAVE"].copy())
+
+    return fits.HDUList(clean_hdus)
+
+
+def download_and_filter_cutout(
+    cutout_url: str,
+    dest_path: Path,
+    max_retries: int = 3,
+    ra_deg: Optional[float] = None,
+    dec_deg: Optional[float] = None,
+    size_arcmin: float = 15.0,
+) -> Dict[str, Any]:
+    """
+    Downloads the cutout MEF (or resolves DataLink + falls back to NASA AWS S3 + Cutout2D
+    if IRSA IBE returns 502/503), drops PSF and ZODI, and extracts metadata.
+    """
+    # Build ordered download candidate list: [(url, needs_local_cutout), ...]
+    download_candidates: List[Tuple[str, bool]] = []
+    if "datalink/links/spherex" in cutout_url and ra_deg is not None and dec_deg is not None:
+        download_candidates.extend(
+            _resolve_datalink_candidates(cutout_url, ra_deg, dec_deg, size_arcmin)
+        )
+    else:
+        download_candidates.append((cutout_url, False))
+        # If this is an IRSA ibe/data/spherex/... URL, also append direct NASA S3 fallback
+        if "irsa.ipac.caltech.edu/ibe/data/spherex/" in cutout_url:
+            s3_key = cutout_url.split("irsa.ipac.caltech.edu/ibe/data/spherex/", 1)[1].split("?")[0]
+            download_candidates.append((f"https://nasa-irsa-spherex.s3.amazonaws.com/{s3_key}", True))
+
+    if not download_candidates:
+        download_candidates.append((cutout_url, False))
+
     raw_data: Optional[bytes] = None
+    needs_local_cutout = False
+    used_url = cutout_url
     last_err: Optional[Exception] = None
 
-    for attempt in range(1, max_retries + 1):
-        try:
-            req = urllib.request.Request(
-                cutout_url,
-                headers={"User-Agent": "SPHEREx-Data-Pipeline/2.0 (IRSA-QR2)"}
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                candidate = resp.read()
-            if len(candidate) <= 2880 or not candidate.startswith(b"SIMPLE  ="):
-                raise ValueError(
-                    f"Response was not a valid FITS cutout (len={len(candidate)})"
+    for cand_url, cand_needs_cutout in download_candidates:
+        if cand_needs_cutout:
+            print(f"    -> Falling back to NASA AWS S3 mirror (local spatial cutout)...")
+        for attempt in range(1, max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    cand_url,
+                    headers={"User-Agent": "SPHEREx-Data-Pipeline/2.0 (IRSA-QR2)"}
                 )
-            raw_data = candidate
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    candidate = resp.read()
+                if len(candidate) <= 2880 or not candidate.startswith(b"SIMPLE  ="):
+                    raise ValueError(
+                        f"Response was not a valid FITS file (len={len(candidate)})"
+                    )
+                raw_data = candidate
+                needs_local_cutout = cand_needs_cutout
+                used_url = cand_url
+                break
+            except Exception as e:
+                last_err = e
+                print(f"    [Retry {attempt}/{max_retries}] Download warning ({_short_err(e)})")
+                if "502" in str(e) or "503" in str(e):
+                    # Switch immediately to next mirror/S3 candidate on upstream proxy errors
+                    break
+                time.sleep(1.5 * attempt)
+        if raw_data is not None:
             break
-        except Exception as e:
-            last_err = e
-            print(f"    [Retry {attempt}/{max_retries}] Download warning: {e}")
-            time.sleep(1.5 * attempt)
 
     if raw_data is None or len(raw_data) < 2880:
         raise RuntimeError(f"Failed to download cutout from {cutout_url}: {last_err}")
 
-    # 2. Parse HDUs and filter out PSF and ZODI extensions to save space
+    # 2. Parse HDUs, slice locally if downloaded full frame from S3, and drop PSF/ZODI
     # Try astropy if available, otherwise pure Python FITS splitter
     try:
         from astropy.io import fits
@@ -492,8 +699,14 @@ def download_and_filter_cutout(cutout_url: str, dest_path: Path, max_retries: in
         from astropy.wcs import WCS
         import astropy.units as u
         from astropy.coordinates import SkyCoord
+        from astropy import log as astropy_log
+        astropy_log.setLevel("ERROR")
 
         hdulist = fits.open(io.BytesIO(raw_data))
+        if needs_local_cutout and ra_deg is not None and dec_deg is not None:
+            sliced = _slice_local_cutout_hdulist(hdulist, ra_deg, dec_deg, size_arcmin)
+            hdulist.close()
+            hdulist = sliced
 
         # Primary header carries software version
         version = hdulist[0].header.get("VERSION", "unknown")
@@ -618,7 +831,7 @@ def download_and_filter_cutout(cutout_url: str, dest_path: Path, max_retries: in
         "bandwidth_um": bandwidth_um,
         "size_bytes": saved_size,
         "sha256": calculate_sha256(dest_path),
-        "source_url": cutout_url
+        "source_url": used_url
     }
 
 
@@ -827,14 +1040,19 @@ def main():
                 continue
 
         manifest: List[Dict[str, Any]] = []
-        region_dl_failed = False
+        skipped_count = 0
 
         for idx, rec in enumerate(records, 1):
             uri = rec["uri"]
-            # Clean filename from URI
-            base_name = uri.split("?")[0].split("/")[-1]
-            if not base_name.endswith(".fits"):
-                base_name = f"spherex_cutout_{idx:03d}.fits"
+            # Clean filename from URI (handle DataLink URLs cleanly)
+            if "datalink/links/spherex" in uri and rec.get("obsid"):
+                safe_obs = rec["obsid"].replace("/", "_").replace(":", "_")
+                det_suffix = uri.split("/")[-1] if "/" in uri else f"{idx:03d}"
+                base_name = f"spherex_{safe_obs}_{det_suffix}.fits"
+            else:
+                base_name = uri.split("?")[0].split("/")[-1]
+                if not base_name.endswith(".fits"):
+                    base_name = f"spherex_cutout_{idx:03d}.fits"
             dest_file = reg_dir / base_name
 
             # Resume from cache if file already exists and is non-empty
@@ -855,17 +1073,22 @@ def main():
 
             print(f"  [{idx}/{len(records)}] Downloading cutout: {base_name}...")
             try:
-                file_meta = download_and_filter_cutout(uri, dest_file)
+                file_meta = download_and_filter_cutout(
+                    uri,
+                    dest_file,
+                    ra_deg=ra,
+                    dec_deg=dec,
+                    size_arcmin=size_arcmin,
+                )
                 manifest.append(file_meta)
             except Exception as e:
-                print(f"  [ERROR] Cutout download error for [{reg_id}]: {e}")
-                region_dl_failed = True
-                break
-            time.sleep(0.5)  # Polite pause between requests to IRSA
+                skipped_count += 1
+                print(f"  [WARNING] Skipping cutout {base_name} for [{reg_id}]: {_short_err(e)}")
+                continue
+            time.sleep(0.35)  # Polite pause between requests to IRSA
 
         if not manifest:
-            if region_dl_failed:
-                failed_regions.append(reg_id)
+            failed_regions.append(reg_id)
             print()
             continue
 
@@ -884,10 +1107,9 @@ def main():
         else:
             print(f"  -> No epoch pairs separated by >= 14 days were found for this region.")
 
-        if region_dl_failed:
-            failed_regions.append(reg_id)
-        else:
-            downloaded_regions.append(reg_id)
+        if skipped_count > 0:
+            print(f"  [NOTE] {len(manifest)}/{len(records)} exposures saved for [{reg_id}] ({skipped_count} skipped).")
+        downloaded_regions.append(reg_id)
         print()
 
     if not downloaded_regions:
