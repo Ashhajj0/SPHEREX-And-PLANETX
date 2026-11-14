@@ -500,7 +500,7 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
     const normY = (mouseY / displayH) * maxYIdx;
 
     if (normX >= 0 && normX <= maxXIdx && normY >= 0 && normY <= maxYIdx) {
-      if (realDataset?.manifest.common_grid) {
+      if (isReal && realDataset?.manifest.common_grid) {
         const sky = pixelToSky(normX, normY, realDataset.manifest.common_grid);
         onCursorMove({
           ra_deg: sky.ra_deg,
@@ -797,9 +797,20 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
             {availableRegions.length > 0 && onSelectRegion ? (
               <select
                 aria-label="Select sky region or target"
-                value={activeRegionId || realDataset?.manifest.region.id || ''}
+                value={
+                  isReal
+                    ? (activeRegionId || realDataset?.manifest.region.id || '')
+                    : (CONFIGURED_SKY_REGIONS.find((c) => c.targetId === currentTarget.id)?.id ||
+                      `target:${currentTarget.id}`)
+                }
                 onChange={(e) => {
                   const val = e.target.value;
+                  if (val.startsWith('target:')) {
+                    const tid = val.slice('target:'.length);
+                    const nextTgt = SPHEREX_TARGETS.find((t) => t.id === tid);
+                    if (nextTgt) onSelectTarget(nextTgt);
+                    return;
+                  }
                   const isExported = availableRegions.some((r) => r.id === val);
                   if (isExported) {
                     onSelectRegion(val);
@@ -824,6 +835,15 @@ export const ExplorerPage: React.FC<ExplorerPageProps> = ({
                       {r.name}
                     </option>
                   ))}
+                <optgroup label="Additional Benchmark Targets (Fixture Preview)">
+                  {SPHEREX_TARGETS.filter(
+                    (tgt) => !CONFIGURED_SKY_REGIONS.some((c) => c.targetId === tgt.id)
+                  ).map((tgt) => (
+                    <option key={tgt.id} value={`target:${tgt.id}`}>
+                      {tgt.name} (Fixture Preview)
+                    </option>
+                  ))}
+                </optgroup>
               </select>
             ) : (
               <select

@@ -223,6 +223,28 @@ export async function loadRealData(regionId?: string): Promise<RealLoadResult> {
     // 1. Fetch manifest.json
     const manifestRes = await fetch(`${basePath}/manifest.json`);
     if (!manifestRes.ok) {
+      if (regionId) {
+        const defaultCached = _cachedDatasets.get('__default__');
+        if (defaultCached && defaultCached.manifest?.region?.id === regionId) {
+          _cachedDatasets.set(cacheKey, defaultCached);
+          return {
+            success: true,
+            data: defaultCached,
+            missingFiles: [],
+            missingKeys: [],
+          };
+        }
+        const defaultRes = await loadRealData();
+        if (defaultRes.success && defaultRes.data?.manifest?.region?.id === regionId) {
+          _cachedDatasets.set(cacheKey, defaultRes.data);
+          return {
+            success: true,
+            data: defaultRes.data,
+            missingFiles: [],
+            missingKeys: [],
+          };
+        }
+      }
       missingFiles.push(`${basePath}/manifest.json`);
       console.warn(`[RealData] ${basePath}/manifest.json not found (HTTP ${manifestRes.status})`);
       return {

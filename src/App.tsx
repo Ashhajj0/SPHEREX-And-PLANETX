@@ -164,22 +164,20 @@ export default function App() {
       SPHEREX_TARGETS.find((t) => t.id === cfg?.targetId || t.id === regionId) ||
       SPHEREX_TARGETS[0];
 
+    setDataSource('fixture');
     setCurrentTarget(matchedTarget);
     setActiveRegionId(regionId);
-    if (!realDataset) {
-      setDataSource('fixture');
-      setCursorStatus((prev) => ({
-        ...prev,
-        dataSource: 'fixture',
-        ra_deg: matchedTarget.raDeg,
-        dec_deg: matchedTarget.decDeg,
-        exposure_id: `B${String(currentBand.bandNumber).padStart(3, '0')}`,
-        wavelength_um: currentBand.wavelength,
-        detector: Number(currentBand.detector.replace(/\D/g, '')) || 4,
-        selectedSourceId: matchedTarget.id,
-        regionName: cfg?.name || matchedTarget.field || matchedTarget.name,
-      }));
-    }
+    setCursorStatus((prev) => ({
+      ...prev,
+      dataSource: 'fixture',
+      ra_deg: matchedTarget.raDeg,
+      dec_deg: matchedTarget.decDeg,
+      exposure_id: `B${String(currentBand.bandNumber).padStart(3, '0')}`,
+      wavelength_um: currentBand.wavelength,
+      detector: Number(currentBand.detector.replace(/\D/g, '')) || 4,
+      selectedSourceId: matchedTarget.id,
+      regionName: cfg?.name || matchedTarget.field || matchedTarget.name,
+    }));
     if (navigateToExplorer) {
       setActiveTab('explorer');
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -205,22 +203,26 @@ export default function App() {
   };
 
   const handleSelectTarget = (target: TargetObject) => {
+    const matchedCfg = CONFIGURED_SKY_REGIONS.find((r) => r.targetId === target.id);
+    setDataSource('fixture');
     setCurrentTarget(target);
-    if (!realDataset) {
-      setCursorStatus((prev) => ({
-        ...prev,
-        dataSource: 'fixture',
-        ra_deg: target.raDeg,
-        dec_deg: target.decDeg,
-        selectedSourceId: target.id,
-        regionName: target.field || target.name,
-      }));
-    }
+    setActiveRegionId(matchedCfg ? matchedCfg.id : '');
+    setCursorStatus((prev) => ({
+      ...prev,
+      dataSource: 'fixture',
+      ra_deg: target.raDeg,
+      dec_deg: target.decDeg,
+      exposure_id: `B${String(currentBand.bandNumber).padStart(3, '0')}`,
+      wavelength_um: currentBand.wavelength,
+      detector: Number(currentBand.detector.replace(/\D/g, '')) || 4,
+      selectedSourceId: target.id,
+      regionName: matchedCfg?.name || target.field || target.name,
+    }));
   };
 
   const handleSelectBand = (band: SpectralBand) => {
     setCurrentBand(band);
-    if (!realDataset) {
+    if (dataSource !== 'real') {
       const detNum = Number(band.detector.replace(/\D/g, '')) || 1;
       setCursorStatus((prev) => ({
         ...prev,
@@ -285,9 +287,18 @@ export default function App() {
       decDMS,
       field: 'Pinpoint Sky Center',
     };
+    setDataSource('fixture');
     setCurrentTarget(customTarget);
+    setCursorStatus((prev) => ({
+      ...prev,
+      dataSource: 'fixture',
+      selectedSourceId: customTarget.id,
+      regionName: customTarget.field,
+    }));
     setActiveTab('explorer');
   };
+
+  const activeRealDataset = dataSource === 'real' ? realDataset : null;
 
   return (
     <div className="min-h-screen bg-surface text-on-surface flex flex-col font-body-md antialiased selection:bg-primary-container selection:text-on-primary-container">
@@ -334,7 +345,7 @@ export default function App() {
         {activeTab === 'home' && (
           <HomePage
             dataSource={dataSource}
-            realDataset={realDataset}
+            realDataset={activeRealDataset}
             availableRegions={availableRegions}
             activeRegionId={activeRegionId}
             onSelectRegion={(rid) => handleSelectRegion(rid, true)}
@@ -355,7 +366,7 @@ export default function App() {
         {activeTab === 'explorer' && (
           <ExplorerPage
             dataSource={dataSource}
-            realDataset={realDataset}
+            realDataset={activeRealDataset}
             availableRegions={availableRegions}
             activeRegionId={activeRegionId}
             onSelectRegion={(rid) => handleSelectRegion(rid, false)}
@@ -379,14 +390,14 @@ export default function App() {
         {activeTab === 'moving-objects' && (
           <MovingObjectsPage
             dataSource={dataSource}
-            realDataset={realDataset}
+            realDataset={activeRealDataset}
           />
         )}
 
         {activeTab === 'method' && (
           <MethodPage
             dataSource={dataSource}
-            realDataset={realDataset}
+            realDataset={activeRealDataset}
           />
         )}
 
